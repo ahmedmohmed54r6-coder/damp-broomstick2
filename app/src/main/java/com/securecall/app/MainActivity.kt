@@ -596,6 +596,25 @@ class MainActivity : Activity() {
         pendingAction = null
     }
 
+    /** Asks the user (standard Android system dialog) to make SecureCall a device admin, so
+     *  Settings requires "deactivate admin" before "Uninstall" is usable on this phone.
+     *  Shown once, when child mode is activated; the system dialog explains why, in the
+     *  description text from strings.xml, before the user accepts or declines. */
+    private fun requestUninstallProtection() {
+        val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as android.app.admin.DevicePolicyManager
+        val admin = android.content.ComponentName(this, ChildDeviceAdmin::class.java)
+        if (dpm.isAdminActive(admin)) return
+        try {
+            startActivity(Intent(android.app.admin.DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                putExtra(android.app.admin.DevicePolicyManager.EXTRA_DEVICE_ADMIN, admin)
+                putExtra(
+                    android.app.admin.DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                    getString(R.string.device_admin_description)
+                )
+            })
+        } catch (_: Exception) {}
+    }
+
     private fun startCallService(child: Boolean) {
         CallService.onHangup = { hangup() }
         try {
@@ -676,11 +695,10 @@ class MainActivity : Activity() {
         mode = 2
         curName = prefs.getString("cname", "") ?: ""
         curCode = prefs.getString("ccode", "") ?: ""
-        startCallService(true)
         val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         if (!pm.isIgnoringBatteryOptimizations(packageName))
             toast("لاستمرار الاتصال والحفاظ على البطارية: استثنِ التطبيق من توفير البطارية (زر في صفحة الإعداد)")
-        try { startLockTask() } catch (_: Exception) {}   // screen pinning: the child cannot leave the app easily
+        requestUninstallProtection()
         dim(true)
         standbyTitle.text = "هاتف $curName"
         show(childStandby)
@@ -689,7 +707,11 @@ class MainActivity : Activity() {
 
     private fun leaveChild() {
         stopLive()
-        try { stopLockTask() } catch (_: Exception) {}
+        try {
+            val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as android.app.admin.DevicePolicyManager
+            val admin = android.content.ComponentName(this, ChildDeviceAdmin::class.java)
+            if (dpm.isAdminActive(admin)) dpm.removeActiveAdmin(admin)
+        } catch (_: Exception) {}
         prefs.edit().putBoolean("cactive", false).apply()
         resetCall()
         inSession = false
@@ -710,6 +732,7 @@ class MainActivity : Activity() {
     }
 
     private fun childReturnToStandby() {
+        stopCallService()   // call is over: the notification goes away with it
         dim(true)
         show(childStandby)
         startStandby()
@@ -788,7 +811,7 @@ class MainActivity : Activity() {
 
     private val pairTimeout = Runnable {
         if (callLayout.visibility == View.VISIBLE) return@Runnable
-        if (mode == 2) { status(""); startStandby(); return@Runnable }
+        if (mode == 2) { stopCallService(); status(""); startStandby(); return@Runnable }
         if (attempts >= 2) {
             endCallUi("تعذّر الاتصال بعد عدة محاولات. جرّب الواي فاي أو أضف خادم TURN على الهاتفين.")
         } else {
@@ -917,6 +940,7 @@ class MainActivity : Activity() {
                 parentId = f[1]
                 callType = f[3]
                 wantVideo = callType == "v"
+                startCallService(true)   // notification appears only now, for the real call
                 sendHello("C|$myId|$curName|$parentId")
                 ui.postDelayed(pairTimeout, 45000)
                 status("الأهل يتصلون...")

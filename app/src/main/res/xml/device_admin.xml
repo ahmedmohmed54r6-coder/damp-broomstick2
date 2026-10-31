@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Intentionally empty policy list: SecureCall does not ask for password rules, wipe,
+  camera-disable, or any other device-admin capability. Being an *active* admin app is,
+  by itself, what makes Android require "deactivate as device admin" before "Uninstall"
+  works on the app — that single effect is all this is used for.
+-->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies />
+</device-admin>

@@ -27,6 +27,8 @@ class CallService : Service() {
     }
 
     private var wl: PowerManager.WakeLock? = null
+    /** Remembers whether this run is the child phone's service, so onTaskRemoved knows how to restart it. */
+    private var isChild = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -37,6 +39,7 @@ class CallService : Service() {
             return START_NOT_STICKY
         }
         val child = intent?.getBooleanExtra(EXTRA_CHILD, false) ?: false
+        isChild = child
         val n = buildNotification(child)
         if (Build.VERSION.SDK_INT >= 30) {
             // Parent phone only uses the microphone; the child phone uses camera + microphone.
@@ -95,5 +98,23 @@ class CallService : Service() {
         try { wl?.release() } catch (_: Exception) {}
         wl = null
         super.onDestroy()
+    }
+
+    /**
+     * Called when the task is swiped away from the recent-apps list. On the child phone this is an
+     * emergency line, so the service restarts itself right away instead of staying down; on the
+     * parent phone there is no such need, so it's left to stop normally.
+     * Note: this only survives being swiped from recents. A manual "Force stop" from Android's own
+     * Settings > Apps screen, or uninstalling the app, always stops it — no app can prevent that.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (!isChild) return
+        val restart = Intent(applicationContext, CallService::class.java)
+            .putExtra(EXTRA_CHILD, true)
+        try {
+            if (Build.VERSION.SDK_INT >= 26) applicationContext.startForegroundService(restart)
+            else applicationContext.startService(restart)
+        } catch (_: Exception) {}
     }
 }
