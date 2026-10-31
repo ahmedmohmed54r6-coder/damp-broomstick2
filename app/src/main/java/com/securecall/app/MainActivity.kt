@@ -11,7 +11,9 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.media.AudioManager
 import android.os.Bundle
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -33,14 +35,15 @@ class MainActivity : Activity() {
     private lateinit var pasteField: EditText
     private lateinit var outView: TextView
     private lateinit var statusView: TextView
-    private lateinit var applyBtn: Button
     private lateinit var copyOutBtn: Button
     private lateinit var shareOutBtn: Button
+    private lateinit var diagView: TextView
 
     private var engine: CallEngine? = null
     private var role = 0            // 1 = caller, 2 = callee
     private var offerBlob = ""      // caller: the offer it created
     private var outBlob = ""
+    private var lastHandled = ""
     private var pendingAction: (() -> Unit)? = null
     private var muted = false
     private var camOn = true
@@ -80,6 +83,9 @@ class MainActivity : Activity() {
         }
         col.addView(tv("مكالمة فيديو مشفّرة طرفياً", 22f, true))
         col.addView(tv("الصوت والفيديو يذهبان مباشرة بين الهاتفين. لا يوجد خادم وسيط يرى المحتوى.", 13f))
+        col.addView(tv("المتصل: ولّد الرمز المشترك وأرسله لصديقك، ثم اضغط «ابدأ مكالمة» وأرسل له الرمز الذي ينسخه التطبيق.\n" +
+            "الطرف الآخر: الصق الرمز المشترك، ثم الصق رمز المكالمة في الخانة السفلية وأرسل الرد الذي ينسخه التطبيق.\n" +
+            "المتصل: يلصق الرد في الخانة السفلية فيتصل تلقائياً.", 12f))
 
         codeField = EditText(this).apply {
             hint = "الرمز المشترك (تعرفه أنت وصديقك فقط)"
@@ -107,11 +113,10 @@ class MainActivity : Activity() {
         }
         col.addView(turnField)
 
-        col.addView(btn("١) أنا أبدأ المكالمة") { ensurePerms { begin(1) } })
-        col.addView(btn("٢) أنضم لمكالمة صديقي") { ensurePerms { begin(2) } })
+        col.addView(btn("ابدأ مكالمة (أنا المتصل)") { ensurePerms { startCaller() } })
 
         pasteField = EditText(this).apply {
-            hint = "الصق هنا رمز الطرف الآخر"
+            hint = "الصق هنا ما أرسله لك صديقك (يعمل تلقائياً)"
             setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                 InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -119,9 +124,12 @@ class MainActivity : Activity() {
             textDirection = View.TEXT_DIRECTION_LTR
             textSize = 11f
         }
+        pasteField.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) { onPasted(s?.toString() ?: "") }
+        })
         col.addView(pasteField)
-        applyBtn = btn("تطبيق") { apply() }.apply { visibility = View.GONE }
-        col.addView(applyBtn)
 
         outView = TextView(this).apply {
             setTextColor(Color.parseColor("#9be29b")); textSize = 12f
@@ -155,15 +163,25 @@ class MainActivity : Activity() {
         callLayout.addView(localView, FrameLayout.LayoutParams(dp(110), dp(150), Gravity.TOP or Gravity.END).apply {
             setMargins(dp(12), dp(36), dp(12), 0)
         })
+        diagView = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 11f
+            setBackgroundColor(Color.parseColor("#80000000"))
+            setPadding(dp(6), dp(4), dp(6), dp(4))
+        }
+        callLayout.addView(diagView, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
+            setMargins(dp(8), dp(36), 0, 0)
+        })
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        bar.addView(btn("🎤") {
-            muted = !muted; engine?.setMuted(muted); (it as Button).text = if (muted) "🔇" else "🎤"
-        }.also { b -> b.setOnClickListener {
-            muted = !muted; engine?.setMuted(muted); b.text = if (muted) "🔇" else "🎤"
-        } })
-        bar.addView(btn("📷") {}.also { b -> b.setOnClickListener {
-            camOn = !camOn; engine?.setCameraOn(camOn); b.text = if (camOn) "📷" else "🚫"
-        } })
+        val micBtn = btn("🎤") {}
+        micBtn.setOnClickListener {
+            muted = !muted; engine?.setMuted(muted); micBtn.text = if (muted) "🔇" else "🎤"
+        }
+        bar.addView(micBtn)
+        val camBtn = btn("📷") {}
+        camBtn.setOnClickListener {
+            camOn = !camOn; engine?.setCameraOn(camOn); camBtn.text = if (camOn) "📷" else "🚫"
+        }
+        bar.addView(camBtn)
         bar.addView(btn("🔄") { engine?.flipCamera() })
         bar.addView(btn("إنهاء") { hangup() })
         callLayout.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { setMargins(0, 0, 0, dp(24)) })
@@ -208,7 +226,7 @@ class MainActivity : Activity() {
         return list
     }
 
-    private fun begin(r: Int) {
+    private fun beginEngine(r: Int): CallEngine? {
         resetCall()
         role = r
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -217,48 +235,66 @@ class MainActivity : Activity() {
         am.isSpeakerphoneOn = true
 
         val e = CallEngine(applicationContext, egl, localView, remoteView,
-            { s -> statusView.text = s }, { showCall() })
+            { s -> statusView.text = s }, { showCall() }, { d -> diagView.text = d })
         engine = e
         try { e.start(iceServers()) } catch (ex: Exception) {
-            status("تعذّر تشغيل الاتصال: ${ex.message}"); return
+            status("تعذّر تشغيل الاتصال: ${ex.message}"); return null
         }
-        val code = codeField.text.toString()
-        applyBtn.visibility = View.VISIBLE
-        if (r == 1) {
-            status("جارٍ إنشاء رمز المكالمة...")
-            applyBtn.text = "٣) اتصال (بعد لصق رد صديقك)"
-            e.createOffer({ sdp ->
-                offerBlob = CallCrypto.seal(code, "offer", null, sdp)
-                showOut(offerBlob)
-                status("أرسل رمز المكالمة لصديقك. عندما يرد عليك برمز، الصقه في الأعلى واضغط اتصال.")
-            }, { m -> status("خطأ: $m") })
-        } else {
-            applyBtn.text = "٣) إنشاء الرد"
-            status("الصق رمز المكالمة الذي أرسله صديقك ثم اضغط إنشاء الرد.")
-        }
+        return e
     }
 
-    private fun apply() {
-        val e = engine ?: return
+    /** Caller: creates the call code, copies it, waits for the friend's reply. */
+    private fun startCaller() {
+        val e = beginEngine(1) ?: return
         val code = codeField.text.toString()
-        val text = pasteField.text.toString()
+        status("جارٍ إنشاء رمز المكالمة...")
+        e.createOffer({ sdp ->
+            offerBlob = CallCrypto.seal(code, "offer", null, sdp)
+            showOut(offerBlob)
+            copy(offerBlob)
+            status("تم نسخ رمز المكالمة. الصقه في المحادثة وأرسله لصديقك. عندما يردّ عليك، الصق ردّه في الخانة السفلية.")
+        }, { m -> status("خطأ: $m") })
+    }
+
+    /** Called when text is pasted: the app works out by itself whether it is a call code or a reply. */
+    private fun onPasted(raw: String) {
+        val t = CallCrypto.clean(raw)
+        if (!t.startsWith("SKC1:") || t.length < 200) return
+        if (t == lastHandled) return
+        lastHandled = t
+        val code = codeField.text.toString()
+        if (!CallCrypto.isValid(code)) {
+            toast("اكتب الرمز المشترك أولاً (نفس الرمز عند الطرفين).")
+            lastHandled = ""
+            return
+        }
         try {
-            if (role == 1) {
-                val sdp = CallCrypto.open(code, "answer", CallCrypto.digest(offerBlob), text)
-                status("جارٍ الاتصال...")
-                e.acceptAnswer(sdp) { m -> status("خطأ: $m") }
-            } else {
-                val sdp = CallCrypto.open(code, "offer", null, text)
-                val bind = CallCrypto.digest(text)
-                status("جارٍ إنشاء الرد...")
-                e.acceptOffer(sdp, { ans ->
-                    val blob = CallCrypto.seal(code, "answer", bind, ans)
-                    showOut(blob)
-                    status("أرسل هذا الرد لصديقك. الاتصال يبدأ تلقائياً عندما يطبّقه.")
-                }, { m -> status("خطأ: $m") })
+            when (role) {
+                0 -> { // friend: a call code arrived
+                    val sdp = CallCrypto.open(code, "offer", null, raw)
+                    val bind = CallCrypto.digest(raw)
+                    ensurePerms {
+                        val e = beginEngine(2) ?: return@ensurePerms
+                        status("جارٍ إنشاء الرد...")
+                        e.acceptOffer(sdp, { ans ->
+                            val blob = CallCrypto.seal(code, "answer", bind, ans)
+                            showOut(blob)
+                            copy(blob)
+                            status("تم نسخ الرد. الصقه في المحادثة وأرسله لصديقك، والاتصال يبدأ تلقائياً.")
+                        }, { m -> status("خطأ: $m") })
+                    }
+                }
+                1 -> { // caller: the reply arrived
+                    val e = engine ?: return
+                    val sdp = CallCrypto.open(code, "answer", CallCrypto.digest(offerBlob), raw)
+                    status("جارٍ الاتصال...")
+                    e.acceptAnswer(sdp) { m -> status("خطأ: $m") }
+                }
+                else -> toast("تم استلام الرمز من قبل.")
             }
         } catch (ex: Exception) {
-            status("الرمز غير صحيح، أو الرمز المشترك مختلف، أو انتهت صلاحيته (30 دقيقة). لم يتم الاتصال.")
+            lastHandled = ""
+            status("الرمز غير صحيح، أو الرمز المشترك مختلف عن رمز صديقك، أو انتهت صلاحيته (30 دقيقة).")
         }
     }
 
@@ -288,7 +324,8 @@ class MainActivity : Activity() {
         muted = false; camOn = true
         pasteField.setText("")
         outView.text = ""
-        applyBtn.visibility = View.GONE
+        diagView.text = ""
+        lastHandled = ""
         copyOutBtn.visibility = View.GONE
         shareOutBtn.visibility = View.GONE
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
