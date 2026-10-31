@@ -68,7 +68,9 @@ class Rendezvous(
                     if (failures >= 3) onError("تعذّر الاتصال بخدمة الوسيط. تحقق من الإنترنت.")
                 }
                 if (!stopped) {
-                    try { Thread.sleep(2000) } catch (_: InterruptedException) {}
+                    // normal reconnect after 2 s; while the network is down back off up to 60 s (saves battery)
+                    val wait = if (failures == 0) 2000L else minOf(2000L shl minOf(failures, 5), 60000L)
+                    try { Thread.sleep(wait) } catch (_: InterruptedException) {}
                 }
             }
         }.also { it.isDaemon = true; it.start() }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import org.webrtc.*
+import java.nio.ByteBuffer
 
 /** Thin wrapper around WebRTC: one 1-to-1 call, no signaling server (codes are exchanged by the users). */
 class CallEngine(
@@ -13,7 +14,10 @@ class CallEngine(
     private val remoteView: SurfaceViewRenderer,
     private val onState: (String) -> Unit,
     private val onConnected: () -> Unit,
-    private val onDiag: (String) -> Unit
+    private val onDiag: (String) -> Unit,
+    private val onCommand: (String) -> Unit,
+    private val onEnded: () -> Unit,
+    private val onLevel: (Double) -> Unit
 ) {
     open class Sdp : SdpObserver {
         override fun onCreateSuccess(d: SessionDescription?) {}
@@ -35,13 +39,22 @@ class CallEngine(
     private var gatherCb: ((String) -> Unit)? = null
     private var connectedFired = false
     private var closed = false
+    private var controller = false
+    private var dc: DataChannel? = null
+    private var videoWanted = false
+    private var preferFront = true
+    private var lowRes = false
+    private var lastIce: PeerConnection.IceConnectionState? = null
 
     private var enumerator: CameraEnumerator? = null
     private var camNames: List<String> = emptyList()
     private var camIndex = -1
     private var camStatus = "الكاميرا: جارٍ التشغيل..."
 
-    fun start(iceServers: List<PeerConnection.IceServer>) {
+    fun start(iceServers: List<PeerConnection.IceServer>, withVideo: Boolean, isController: Boolean, lowResolution: Boolean = false) {
+        controller = isController
+        lowRes = lowResolution
+        videoWanted = withVideo
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(app).createInitializationOptions()
         )
@@ -60,7 +73,8 @@ class CallEngine(
         videoSource = f.createVideoSource(false)
         videoTrack = f.createVideoTrack("v0", videoSource)
         videoTrack?.addSink(localView)
-        startCamera()
+        videoTrack?.setEnabled(withVideo)
+        if (withVideo) startCamera() else camStatus = "بدون كاميرا محلية"
 
         val cfg = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
@@ -74,6 +88,40 @@ class CallEngine(
         pc = p
         p.addTrack(audioTrack, listOf("s0"))
         p.addTrack(videoTrack, listOf("s0"))
+        // Control channel (parent -> child): switch camera, video on/off, end. It runs inside the same
+        // DTLS-encrypted connection, which is only established with the paired code.
+        if (controller) {
+            dc = p.createDataChannel("ctl", DataChannel.Init())
+            dc?.registerObserver(dcObs)
+        }
+    }
+
+    private val dcObs = object : DataChannel.Observer {
+        override fun onBufferedAmountChange(l: Long) {}
+        override fun onStateChange() {}
+        override fun onMessage(b: DataChannel.Buffer?) {
+            val bb = b?.data ?: return
+            val bytes = ByteArray(bb.remaining())
+            bb.get(bytes)
+            val msg = String(bytes)
+            main.post { if (!closed) handleCmd(msg) }
+        }
+    }
+
+    private fun handleCmd(c: String) {
+        when (c) {
+            "bye" -> { onEnded(); return }
+            "video:on", "cam:front" -> if (!controller) useFacing(true)
+            "cam:back" -> if (!controller) useFacing(false)
+            "video:off" -> if (!controller) videoOff()
+        }
+        onCommand(c)
+    }
+
+    fun sendCmd(c: String) {
+        val ch = dc ?: return
+        if (ch.state() != DataChannel.State.OPEN) return
+        ch.send(DataChannel.Buffer(ByteBuffer.wrap(c.toByteArray()), false))
     }
 
     // ---------- camera (tries every camera until one works) ----------
@@ -83,14 +131,34 @@ class CallEngine(
         } catch (e: Exception) { Camera1Enumerator(false) }
         enumerator = en
         val names = en.deviceNames.toList()
-        camNames = names.filter { en.isFrontFacing(it) } + names.filter { !en.isFrontFacing(it) }
+        camNames = if (preferFront) names.filter { en.isFrontFacing(it) } + names.filter { !en.isFrontFacing(it) }
+        else names.filter { !en.isFrontFacing(it) } + names.filter { en.isFrontFacing(it) }
         if (camNames.isEmpty()) { setCam("الكاميرا: لا توجد كاميرا في الجهاز"); return }
         openCamera(0)
     }
 
     /** Android takes the camera away when the app is in the background (e.g. while sending the code). */
     fun pauseCamera() { camIndex = -1; disposeCapturer() }
-    fun resumeCamera() { if (!closed && pc != null && capturer == null) startCamera() }
+    fun resumeCamera() { if (!closed && pc != null && capturer == null && videoWanted) startCamera() }
+
+    /** Child side: start (or restart) the camera on the requested side. */
+    fun useFacing(front: Boolean) {
+        preferFront = front
+        videoWanted = true
+        videoTrack?.setEnabled(true)
+        camIndex = -1
+        disposeCapturer()
+        startCamera()
+    }
+
+    /** Child side: stop the camera completely (audio only). */
+    fun videoOff() {
+        videoWanted = false
+        videoTrack?.setEnabled(false)
+        camIndex = -1
+        disposeCapturer()
+        setCam("الكاميرا: متوقفة")
+    }
 
     private fun setCam(s: String) { camStatus = s; onDiag(s) }
 
@@ -113,10 +181,12 @@ class CallEngine(
         capturer = cap
 
         val fmts = try { en.getSupportedFormats(name) ?: emptyList() } catch (e: Exception) { emptyList() }
-        val best = fmts.minByOrNull { Math.abs(it.width * it.height - 640 * 480) }
-        val w = best?.width ?: 640
-        val h = best?.height ?: 480
-        val fps = ((best?.framerate?.max ?: 24000) / 1000).coerceIn(10, 24)
+        // Low-power mode (listening / quick glance): small picture and 10 fps save battery and data.
+        val target = if (lowRes) 320 * 240 else 640 * 480
+        val best = fmts.minByOrNull { Math.abs(it.width * it.height - target) }
+        val w = best?.width ?: (if (lowRes) 320 else 640)
+        val h = best?.height ?: (if (lowRes) 240 else 480)
+        val fps = ((best?.framerate?.max ?: 24000) / 1000).coerceIn(10, if (lowRes) 10 else 24)
         try {
             cap.initialize(helper, app, videoSource!!.capturerObserver)
             cap.startCapture(w, h, fps)
@@ -146,6 +216,7 @@ class CallEngine(
         override fun onIceConnectionChange(s: PeerConnection.IceConnectionState?) {
             main.post {
                 if (closed) return@post
+                lastIce = s
                 when (s) {
                     PeerConnection.IceConnectionState.CONNECTED,
                     PeerConnection.IceConnectionState.COMPLETED -> {
@@ -157,9 +228,14 @@ class CallEngine(
                         }
                     }
                     PeerConnection.IceConnectionState.CHECKING -> onState("جارٍ الاتصال...")
-                    PeerConnection.IceConnectionState.DISCONNECTED -> onState("انقطع الاتصال مؤقتاً")
-                    PeerConnection.IceConnectionState.FAILED ->
+                    PeerConnection.IceConnectionState.DISCONNECTED -> {
+                        onState("انقطع الاتصال مؤقتاً")
+                        main.postDelayed(discCheck, 15000)
+                    }
+                    PeerConnection.IceConnectionState.FAILED -> {
                         onState("فشل الاتصال المباشر (قد تحتاج خادم TURN أو شبكة أخرى)")
+                        if (connectedFired) onEnded()
+                    }
                     else -> {}
                 }
             }
@@ -172,7 +248,9 @@ class CallEngine(
         override fun onIceCandidatesRemoved(c: Array<out IceCandidate>?) {}
         override fun onAddStream(s: MediaStream?) {}
         override fun onRemoveStream(s: MediaStream?) {}
-        override fun onDataChannel(d: DataChannel?) {}
+        override fun onDataChannel(d: DataChannel?) {
+            main.post { if (!closed && d != null) { dc = d; d.registerObserver(dcObs) } }
+        }
         override fun onRenegotiationNeeded() {}
         override fun onTrack(t: RtpTransceiver?) {
             val tr = t?.receiver?.track()
@@ -185,6 +263,12 @@ class CallEngine(
         }
     }
 
+    private val discCheck = Runnable {
+        if (closed || !connectedFired) return@Runnable
+        if (lastIce == PeerConnection.IceConnectionState.DISCONNECTED ||
+            lastIce == PeerConnection.IceConnectionState.FAILED) onEnded()
+    }
+
     /** Every 2 s: how many video frames this phone sent and received (shows which side is not sending). */
     private val statsRunnable = object : Runnable {
         override fun run() {
@@ -192,14 +276,18 @@ class CallEngine(
             pc?.getStats { report ->
                 var sent = -1L
                 var recv = -1L
+                var lvl = -1.0
                 for (s in report.statsMap.values) {
                     val m = s.members
                     if (s.type == "outbound-rtp" && m["kind"] == "video")
                         sent = (m["framesEncoded"] as? Number)?.toLong() ?: sent
+                    if (s.type == "inbound-rtp" && m["kind"] == "audio")
+                        lvl = (m["audioLevel"] as? Number)?.toDouble() ?: lvl
                     if (s.type == "inbound-rtp" && m["kind"] == "video")
                         recv = (m["framesDecoded"] as? Number)?.toLong() ?: recv
                 }
                 main.post {
+                    if (!closed && lvl >= 0) onLevel(lvl)
                     if (!closed) onDiag(
                         camStatus + "\nفيديو مُرسَل: " + (if (sent < 0) "-" else sent.toString()) +
                             " | مستقبَل: " + (if (recv < 0) "-" else recv.toString())
@@ -288,6 +376,7 @@ class CallEngine(
         try { videoTrack?.removeSink(localView) } catch (_: Exception) {}
         try { remoteTrack?.removeSink(remoteView) } catch (_: Exception) {}
         disposeCapturer()
+        try { dc?.unregisterObserver(); dc?.close() } catch (_: Exception) {}
         try { pc?.close(); pc?.dispose() } catch (_: Exception) {}
         try { videoSource?.dispose() } catch (_: Exception) {}
         try { helper?.dispose() } catch (_: Exception) {}

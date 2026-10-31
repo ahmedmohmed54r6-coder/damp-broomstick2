@@ -19,6 +19,7 @@ import android.os.PowerManager
 class CallService : Service() {
     companion object {
         const val ACTION_STOP = "com.securecall.app.STOP"
+        const val EXTRA_CHILD = "child"
         private const val CH = "securecall_call"
         private const val ID = 77
         /** Set by MainActivity: what the notification's "End" button does. */
@@ -35,13 +36,17 @@ class CallService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        val n = buildNotification()
+        val child = intent?.getBooleanExtra(EXTRA_CHILD, false) ?: false
+        val n = buildNotification(child)
         if (Build.VERSION.SDK_INT >= 30) {
-            startForeground(
-                ID, n,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
+            // Parent phone only uses the microphone; the child phone uses camera + microphone.
+            var type = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            if (child) type = type or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            // location type only when the permission is granted (Android 14 rejects it otherwise)
+            if (child && checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) type = type or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            startForeground(ID, n, type)
         } else {
             startForeground(ID, n)
         }
@@ -49,13 +54,13 @@ class CallService : Service() {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "securecall:call").apply {
                 setReferenceCounted(false)
-                acquire(3 * 60 * 60 * 1000L)
+                if (child) acquire() else acquire(3 * 60 * 60 * 1000L)
             }
         }
         return START_NOT_STICKY
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(child: Boolean): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) {
             nm.createNotificationChannel(NotificationChannel(CH, "SecureCall", NotificationManager.IMPORTANCE_LOW))
@@ -72,14 +77,18 @@ class CallService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CH) else Notification.Builder(this)
-        return b.setSmallIcon(android.R.drawable.stat_sys_phone_call)
+        b.setSmallIcon(android.R.drawable.stat_sys_phone_call)
             .setContentTitle("SecureCall")
-            .setContentText("مكالمة مشفّرة نشطة — اضغط للعودة")
+            .setContentText(
+                if (child) "وضع الطفل: الهاتف جاهز لنداء الأهل (مشفّر)"
+                else "مكالمة مشفّرة نشطة — اضغط للعودة"
+            )
             .setContentIntent(open)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "إنهاء", stop)
             .setCategory(Notification.CATEGORY_CALL)
             .setOngoing(true)
-            .build()
+        // The child phone can only be stopped with the parent's PIN inside the app, so no End button there.
+        if (!child) b.addAction(android.R.drawable.ic_menu_close_clear_cancel, "إنهاء", stop)
+        return b.build()
     }
 
     override fun onDestroy() {
