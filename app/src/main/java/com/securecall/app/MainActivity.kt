@@ -16,6 +16,8 @@ import android.graphics.drawable.RippleDrawable
 import android.graphics.Typeface
 import android.media.AudioManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -58,6 +60,14 @@ class MainActivity : Activity() {
     private var rv: Rendezvous? = null
     private var auto = false
     private var waitingOffer = false
+    private var waitingPeer = false
+    private var myId = ""
+    private var peerId = ""
+    private var attempts = 0
+    private var waitStart = 0L
+    private val dead = mutableSetOf<String>()
+    private val ui = Handler(Looper.getMainLooper())
+    private var svcOn = false
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -66,6 +76,9 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         egl = EglBase.create()
         buildUi()
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
     }
 
     // ---------- design ----------
@@ -206,10 +219,9 @@ class MainActivity : Activity() {
         turnField.setText(prefs.getString("turn", "") ?: "")
 
         // start (automatic, through the mailbox)
-        col.addView(pill("📞  ابدأ مكالمة", true) { ensurePerms { startAutoCaller() } }, cardLp(18))
-        col.addView(pill("🔗  انضم لمكالمة صديقي", false) { ensurePerms { startAutoCallee() } }, cardLp(10))
+        col.addView(pill("📞  اتصال", true) { ensurePerms { startCall() } }, cardLp(18))
         col.addView(
-            label("اتفقا على نفس الرمز المشترك، ثم تضغط أنت «ابدأ» ويضغط صديقك «انضم» — بدون نسخ أو لصق.\n" +
+            label("اتفقا على نفس الرمز المشترك، ثم يضغط كلاكما «اتصال». الأول ينتظر والثاني يلتحق به تلقائياً — بدون نسخ أو لصق ولا يهم من يبدأ.\n" +
                 "تُستخدم خدمة ntfy.sh كصندوق بريد لنقل رموز مشفّرة فقط، ولا ترى الصوت ولا الفيديو.", 11.5f, MUTED, false)
                 .apply { gravity = Gravity.CENTER },
             cardLp(12)
@@ -321,6 +333,24 @@ class MainActivity : Activity() {
     }
 
     // ---------- flow ----------
+    /** Keeps the call alive in the background (camera + microphone + network) while it is running. */
+    private fun startCallService() {
+        CallService.onHangup = { hangup() }
+        try {
+            val i = Intent(this, CallService::class.java)
+            if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+            svcOn = true
+        } catch (e: Exception) {
+            svcOn = false
+        }
+    }
+
+    private fun stopCallService() {
+        CallService.onHangup = null
+        svcOn = false
+        try { stopService(Intent(this, CallService::class.java)) } catch (_: Exception) {}
+    }
+
     private fun ensurePerms(action: () -> Unit) {
         if (!CallCrypto.isValid(codeField.text.toString())) {
             toast("الرمز المشترك غير صالح. ولّد رمزاً عشوائياً أو الصق الرمز الذي أرسله صديقك.")
@@ -328,14 +358,15 @@ class MainActivity : Activity() {
         }
         val need = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
             .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (need.isEmpty()) action() else {
-            pendingAction = action
+        if (need.isEmpty()) { startCallService(); action() } else {
+            pendingAction = { startCallService(); action() }
             requestPermissions(need.toTypedArray(), 1)
         }
     }
 
     override fun onRequestPermissionsResult(rc: Int, perms: Array<out String>, res: IntArray) {
         super.onRequestPermissionsResult(rc, perms, res)
+        if (rc != 1) return
         if (res.isNotEmpty() && res.all { it == PackageManager.PERMISSION_GRANTED }) pendingAction?.invoke()
         else toast("يلزم السماح بالكاميرا والميكروفون")
         pendingAction = null
@@ -403,17 +434,80 @@ class MainActivity : Activity() {
             { msg -> runOnUiThread { onRemote(msg) } },
             { m -> runOnUiThread { status(m) } })
 
-    /** Automatic caller: publishes the encrypted offer to the mailbox and waits for the answer there. */
-    private fun startAutoCaller() {
+    private fun sendHello(code: String) {
+        val blob = CallCrypto.seal(code, "hello", null, myId)
+        rv?.publish(blob) { _ -> }
+    }
+
+    /** Re-announces presence every 15 s while waiting for the friend (up to 5 minutes). */
+    private val helloTick = object : Runnable {
+        override fun run() {
+            if (!waitingPeer) return
+            if (System.currentTimeMillis() - waitStart > 5 * 60 * 1000L) {
+                resetCall()
+                stopCallService()
+                status("انتهت مهلة الانتظار (5 دقائق) ولم يلتحق صديقك. اضغط «اتصال» للمحاولة من جديد.")
+                return
+            }
+            sendHello(codeField.text.toString())
+            ui.postDelayed(this, 15000)
+        }
+    }
+
+    /** If the two phones do not connect within 45 s, try again with a fresh start (up to 3 tries). */
+    private val pairTimeout = Runnable {
+        if (auto && callLayout.visibility != View.VISIBLE) {
+            if (peerId.isNotEmpty()) dead.add(peerId)
+            if (attempts >= 2) {
+                resetCall()
+                stopCallService()
+                status("تعذّر الاتصال بعد عدة محاولات. جرّب الواي فاي على الهاتفين، أو أضف خادم TURN على الهاتفين.")
+            } else {
+                attempts++
+                status("لم ينجح الاتصال، أعيد المحاولة تلقائياً...")
+                startCall(true)
+            }
+        }
+    }
+
+    /** One button for both people: announce presence in the mailbox; whoever finds the other pairs up. */
+    private fun startCall(retry: Boolean = false) {
         val code = codeField.text.toString()
         if (!checkStrong(code)) return
         saveCfg()
-        val e = beginEngine(1) ?: return
+        if (!retry) attempts = 0
+        resetCall()
         auto = true
+        waitingPeer = true
+        waitStart = System.currentTimeMillis()
+        myId = CallCrypto.newCode().filter { it != '-' }.take(10)
+        peerId = ""
         val r = newMailbox(code)
         rv = r
-        r.subscribe(System.currentTimeMillis() / 1000 - 5)
-        status("جارٍ تجهيز المكالمة...")
+        r.subscribe(System.currentTimeMillis() / 1000 - 90)
+        sendHello(code)
+        ui.postDelayed(helloTick, 15000)
+        status("بانتظار صديقك... اطلب منه أن يفتح التطبيق ويضغط «اتصال» بنفس الرمز المشترك.")
+    }
+
+    /** The friend's presence message arrived: the larger id becomes the caller (same result on both phones). */
+    private fun onHello(code: String, id: String) {
+        if (id == myId || id in dead) return
+        waitingPeer = false
+        ui.removeCallbacks(helloTick)
+        peerId = id
+        if (myId > id) becomeCaller(code) else becomeCallee()
+    }
+
+    private fun becomeCaller(code: String) {
+        status("وجدت صديقك، جارٍ تجهيز المكالمة...")
+        val keep = rv
+        rv = null                       // resetCall() inside beginEngine must not stop the mailbox
+        val e = beginEngine(1)
+        rv = keep
+        if (e == null) return
+        auto = true
+        ui.postDelayed(pairTimeout, 45000)
         e.createOffer({ sdp ->
             val blob = CallCrypto.seal(code, "offer", null, sdp)
             offerBlob = blob
@@ -421,40 +515,35 @@ class MainActivity : Activity() {
                 status("الرمز أطول من الحد المسموح للإرسال التلقائي. استعمل الطريقة اليدوية.")
                 showOut(blob); copy(blob)
             } else {
-                r.publish(blob) { ok ->
-                    runOnUiThread {
-                        status(if (ok) "بانتظار صديقك... اطلب منه أن يضغط «انضم لمكالمة صديقي» بنفس الرمز المشترك."
-                        else "تعذّر الإرسال عبر الإنترنت. تحقق من الاتصال ثم حاول مرة أخرى.")
-                    }
+                rv?.publish(blob) { ok ->
+                    runOnUiThread { if (!ok) status("تعذّر الإرسال عبر الإنترنت. تحقق من الاتصال.") }
                 }
             }
         }, { m -> status("خطأ: $m") })
     }
 
-    /** Automatic callee: watches the mailbox for the caller's offer, then answers it there. */
-    private fun startAutoCallee() {
-        val code = codeField.text.toString()
-        if (!checkStrong(code)) return
-        saveCfg()
+    private fun becomeCallee() {
+        status("وجدت صديقك، بانتظار بدء المكالمة...")
+        val keep = rv
+        rv = null
         resetCall()
+        rv = keep
         auto = true
         waitingOffer = true
-        val r = newMailbox(code)
-        rv = r
-        r.subscribe(System.currentTimeMillis() / 1000 - 180)
-        status("بانتظار مكالمة من صديقك... اطلب منه أن يضغط «ابدأ مكالمة».")
+        ui.postDelayed(pairTimeout, 45000)
     }
 
     private fun answerOffer(code: String, t: String, sdp: String) {
         val bind = CallCrypto.digest(t)
         val keep = rv
-        rv = null                       // resetCall() inside beginEngine must not stop the mailbox
+        rv = null
         val e = beginEngine(2)
         rv = keep
         if (e == null) return
         auto = true
         lastHandled = t
-        status("وصلتك مكالمة، جارٍ الرد...")
+        ui.postDelayed(pairTimeout, 45000)
+        status("وصلتك المكالمة، جارٍ الرد...")
         e.acceptOffer(sdp, { ans ->
             val blob = CallCrypto.seal(code, "answer", bind, ans)
             if (blob.length > 4000) {
@@ -462,28 +551,33 @@ class MainActivity : Activity() {
                 showOut(blob); copy(blob)
             } else {
                 rv?.publish(blob) { ok ->
-                    runOnUiThread {
-                        status(if (ok) "تم الرد، جارٍ الاتصال..." else "تعذّر إرسال الرد. تحقق من الاتصال بالإنترنت.")
-                    }
+                    runOnUiThread { if (!ok) status("تعذّر إرسال الرد. تحقق من الاتصال بالإنترنت.") }
                 }
             }
         }, { m -> status("خطأ: $m") })
     }
 
-    /** A message arrived from the mailbox (own messages and foreign junk simply fail to decrypt and are ignored). */
+    /** A message arrived from the mailbox. Own messages and anything that does not decrypt are ignored. */
     private fun onRemote(msg: String) {
         val t = Regex("SKC1:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
-        if (t == lastHandled || t == offerBlob) return
+        if (callLayout.visibility == View.VISIBLE) return
         val code = codeField.text.toString()
-        val inCall = callLayout.visibility == View.VISIBLE
-        if (role == 1 && !inCall) {
+        if (waitingPeer) {
+            val id = try {
+                CallCrypto.open(code, "hello", null, t, 90 * 1000L)
+            } catch (_: Exception) { return }
+            onHello(code, id)
+            return
+        }
+        if (t == lastHandled || t == offerBlob) return
+        if (role == 1) {
             val sdp = try {
                 CallCrypto.open(code, "answer", CallCrypto.digest(offerBlob), t)
             } catch (_: Exception) { return }
             lastHandled = t
             status("جارٍ الاتصال...")
             engine?.acceptAnswer(sdp) { m -> status("خطأ: $m") }
-        } else if ((waitingOffer || role == 2) && !inCall) {
+        } else if (waitingOffer || role == 2) {
             val sdp = try {
                 CallCrypto.open(code, "offer", null, t, 3 * 60 * 1000L)
             } catch (_: Exception) { return }
@@ -542,6 +636,7 @@ class MainActivity : Activity() {
     }
 
     private fun showCall() {
+        ui.removeCallbacksAndMessages(null)
         rv?.stop(); rv = null
         setup.visibility = View.GONE
         callLayout.visibility = View.VISIBLE
@@ -549,6 +644,7 @@ class MainActivity : Activity() {
 
     private fun hangup() {
         resetCall()
+        stopCallService()
         callLayout.visibility = View.GONE
         setup.visibility = View.VISIBLE
         status("انتهت المكالمة.")
@@ -556,7 +652,8 @@ class MainActivity : Activity() {
 
     private fun resetCall() {
         engine?.close(); engine = null
-        rv?.stop(); rv = null; auto = false; waitingOffer = false
+        ui.removeCallbacksAndMessages(null)
+        rv?.stop(); rv = null; auto = false; waitingOffer = false; waitingPeer = false
         remoteView.clearImage(); localView.clearImage()
         role = 0; offerBlob = ""; outBlob = ""
         muted = false; camOn = true
@@ -584,7 +681,7 @@ class MainActivity : Activity() {
         toast("تم النسخ")
     }
 
-    override fun onPause() { engine?.pauseCamera(); super.onPause() }
+    override fun onPause() { if (!svcOn) engine?.pauseCamera(); super.onPause() }
     override fun onResume() { super.onResume(); engine?.resumeCamera() }
 
     @Deprecated("Deprecated in Java")
@@ -593,6 +690,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        stopCallService()
+        ui.removeCallbacksAndMessages(null)
         rv?.stop(); rv = null
         engine?.close(); engine = null
         try { remoteView.release(); localView.release() } catch (_: Exception) {}
