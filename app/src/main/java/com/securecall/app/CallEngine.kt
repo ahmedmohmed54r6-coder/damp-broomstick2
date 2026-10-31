@@ -65,6 +65,10 @@ class CallEngine(
         val cfg = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
+            // With a TURN server: force the relay path. The relay address stays alive while the codes
+            // travel through the chat app, and it also hides both phones' IP addresses.
+            if (iceServers.any { sv -> sv.urls.any { u -> u.startsWith("turn") } })
+                iceTransportsType = PeerConnection.IceTransportsType.RELAY
         }
         val p = f.createPeerConnection(cfg, observer)!!
         pc = p
@@ -83,6 +87,10 @@ class CallEngine(
         if (camNames.isEmpty()) { setCam("الكاميرا: لا توجد كاميرا في الجهاز"); return }
         openCamera(0)
     }
+
+    /** Android takes the camera away when the app is in the background (e.g. while sending the code). */
+    fun pauseCamera() { camIndex = -1; disposeCapturer() }
+    fun resumeCamera() { if (!closed && pc != null && capturer == null) startCamera() }
 
     private fun setCam(s: String) { camStatus = s; onDiag(s) }
 
@@ -208,10 +216,18 @@ class CallEngine(
         else main.postDelayed({ finishGather() }, 7000)
     }
 
+    /** Summary of the ICE candidates inside the code just created (for troubleshooting). */
+    var candInfo = ""
+        private set
+
     private fun finishGather() {
         val cb = gatherCb ?: return
         gatherCb = null
         val d = pc?.localDescription?.description ?: return
+        val host = Regex("typ host").findAll(d).count()
+        val srflx = Regex("typ srflx").findAll(d).count()
+        val relay = Regex("typ relay").findAll(d).count()
+        candInfo = "المرشحات: host=$host | srflx=$srflx | relay=$relay"
         cb(d)
     }
 

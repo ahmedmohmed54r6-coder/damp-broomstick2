@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- shackle -->
+    <path
+        android:pathData="M40,50 V44 A14,14 0 0 1 68,44 V50"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="6"
+        android:strokeLineCap="round" />
+    <!-- body with a keyhole cut out -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M38,50 H70 A6,6 0 0 1 76,56 V76 A6,6 0 0 1 70,82 H38 A6,6 0 0 1 32,76 V56 A6,6 0 0 1 38,50 Z M50,64 a4,4 0 1 0 8,0 a4,4 0 1 0 -8,0 Z M52.5,68 H55.5 L56.5,75 H51.5 Z" />
+</vector>

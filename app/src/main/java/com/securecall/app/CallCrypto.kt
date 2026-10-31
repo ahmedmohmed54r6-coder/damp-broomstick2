@@ -36,6 +36,15 @@ object CallCrypto {
 
     fun normalize(s: String): String = s.uppercase().filter { it in ALPHABET }
     fun isValid(s: String): Boolean = normalize(s).length == 26
+    /** A human-typed code like AAAAA... would be guessable; require a reasonably varied code. */
+    fun isStrong(s: String): Boolean = isValid(s) && normalize(s).toSet().size >= 10
+
+    /** Mailbox name derived from the shared code (independent of the encryption key). */
+    fun roomId(code: String): String {
+        val h = hmac("SecureCall-v1-room".toByteArray(), normalize(code).toByteArray())
+        return "sc-" + h.copyOf(20).joinToString("") { "%02x".format(it) }
+    }
+
     fun clean(s: String): String = s.filter { !it.isWhitespace() }
     fun digest(blob: String): ByteArray = MessageDigest.getInstance("SHA-256").digest(clean(blob).toByteArray())
 
@@ -74,7 +83,7 @@ object CallCrypto {
     }
 
     /** Throws on a wrong code, a tampered/foreign message, a wrong kind/binding, or an expired message. */
-    fun open(code: String, kind: String, bind: ByteArray?, blob: String): String {
+    fun open(code: String, kind: String, bind: ByteArray?, blob: String, maxAgeMs: Long = MAX_AGE_MS): String {
         val b = clean(blob)
         require(b.startsWith(PREFIX)) { "bad format" }
         val raw = Base64.decode(b.removePrefix(PREFIX), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
@@ -92,7 +101,7 @@ object CallCrypto {
         }
         try {
             val ts = ByteBuffer.wrap(plain, 0, 8).long
-            require(Math.abs(System.currentTimeMillis() - ts) < MAX_AGE_MS) { "expired" }
+            require(Math.abs(System.currentTimeMillis() - ts) < maxAgeMs) { "expired" }
             val gz = plain.copyOfRange(8, plain.size)
             return String(GZIPInputStream(ByteArrayInputStream(gz)).readBytes())
         } finally {
