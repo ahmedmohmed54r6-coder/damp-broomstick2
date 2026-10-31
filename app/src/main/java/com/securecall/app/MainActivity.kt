@@ -156,14 +156,16 @@ class MainActivity : Activity() {
             setMargins(dp(12), dp(36), dp(12), 0)
         })
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        bar.addView(btn("🎤") {
-            muted = !muted; engine?.setMuted(muted); (it as Button).text = if (muted) "🔇" else "🎤"
-        }.also { b -> b.setOnClickListener {
-            muted = !muted; engine?.setMuted(muted); b.text = if (muted) "🔇" else "🎤"
-        } })
-        bar.addView(btn("📷") {}.also { b -> b.setOnClickListener {
-            camOn = !camOn; engine?.setCameraOn(camOn); b.text = if (camOn) "📷" else "🚫"
-        } })
+        val micBtn = btn("🎤") {}
+        micBtn.setOnClickListener {
+            muted = !muted; engine?.setMuted(muted); micBtn.text = if (muted) "🔇" else "🎤"
+        }
+        bar.addView(micBtn)
+        val camBtn = btn("📷") {}
+        camBtn.setOnClickListener {
+            camOn = !camOn; engine?.setCameraOn(camOn); camBtn.text = if (camOn) "📷" else "🚫"
+        }
+        bar.addView(camBtn)
         bar.addView(btn("🔄") { engine?.flipCamera() })
         bar.addView(btn("إنهاء") { hangup() })
         callLayout.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { setMargins(0, 0, 0, dp(24)) })
