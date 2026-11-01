@@ -19,6 +19,19 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      # Delete leftover files from older versions (anything that is not one of the real V18 sources)
+      - name: Remove stray Kotlin files
+        run: |
+          cd app/src/main/java/com/securecall/app
+          KEEP="Alarm.kt CallCrypto.kt CallEngine.kt CallService.kt ChildDeviceAdmin.kt ChildListenService.kt Fcm.kt Fonts.kt MainActivity.kt Qr.kt Rendezvous.kt Store.kt TurnTools.kt"
+          for f in *.kt; do
+            case " $KEEP " in
+              *" $f "*) ;;
+              *) echo "removing stray file: $f"; rm -f "$f" ;;
+            esac
+          done
+          ls
+
       # Optional: only if the GOOGLE_SERVICES_JSON secret (base64) exists
       - name: Create google-services.json
         env:
