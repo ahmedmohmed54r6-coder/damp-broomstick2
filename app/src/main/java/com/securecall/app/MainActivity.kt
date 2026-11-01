@@ -65,6 +65,9 @@ class MainActivity : Activity() {
     private lateinit var turnP: EditText
     private lateinit var turnC: EditText
     private lateinit var wakeUrl: EditText
+    private lateinit var readyView: TextView
+    private lateinit var relayP: EditText
+    private lateinit var relayC: EditText
     private lateinit var statusP: TextView
     private lateinit var standbyTitle: TextView
     private lateinit var standbyStatus: TextView
@@ -85,7 +88,14 @@ class MainActivity : Activity() {
      *  plain root/backup file read on the device no longer exposes them in clear text. Falls back
      *  to a normal file only if the Keystore itself is unavailable (very old/broken devices). */
     private val prefs by lazy { Store.prefs(this) }
+    companion object {
+        /** True while the child's app is on screen (the background listener then leaves calls to the app). */
+        @Volatile var childVisible = false
+    }
+
     private val ui = Handler(Looper.getMainLooper())
+    /** Periodic ticks live here, NOT in [ui]: resetCall()/showCall() clear every callback of [ui]. */
+    private val tickH = Handler(Looper.getMainLooper())
 
     private var mode = 0                // 1 = parent, 2 = child
     private var engine: CallEngine? = null
@@ -159,8 +169,9 @@ class MainActivity : Activity() {
             mode == 2 -> show(childSetup)
             else -> show(modeScreen)
         }
+        Relay.load(prefs)
         handleWakeIntent(intent)
-        ui.postDelayed(notifWatchTick, 20000)
+        tickH.postDelayed(notifWatchTick, 20000)
     }
 
     // ---------- design ----------
@@ -188,12 +199,14 @@ class MainActivity : Activity() {
     private fun label(t: String, size: Float, color: Int, bold: Boolean): TextView =
         TextView(this).apply {
             text = t; textSize = size; setTextColor(color)
+            Fonts.get(context)?.let { typeface = it }
             if (bold) setTypeface(typeface, Typeface.BOLD)
         }
 
     private fun pill(t: String, primary: Boolean, onClick: () -> Unit): TextView =
         TextView(this).apply {
             text = t; textSize = 15f; gravity = Gravity.CENTER
+            Fonts.get(context)?.let { typeface = it }
             setTextColor(if (primary) Color.parseColor("#04141A") else Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)
             setPadding(dp(16), dp(14), dp(16), dp(14))
@@ -218,6 +231,7 @@ class MainActivity : Activity() {
     private fun field(hintText: String): EditText =
         EditText(this).apply {
             hint = hintText; setHintTextColor(MUTED); setTextColor(Color.WHITE)
+            Fonts.get(context)?.let { typeface = it }
             textSize = 14f
             background = rounded(FIELD, 14, STROKE)
             setPadding(dp(14), dp(12), dp(14), dp(12))
@@ -350,7 +364,7 @@ class MainActivity : Activity() {
                 prefs.edit().remove("cf_id").remove("cf_tok").remove("cf_lines").remove("cf_exp").apply()
                 toast("أُزيل Cloudflare")
             }
-            .show()
+            .showStyled()
     }
 
     private fun testTurn(target: EditText) {
@@ -364,8 +378,25 @@ class MainActivity : Activity() {
         if (servers.isEmpty()) { toast("أضف خادم TURN أولاً (لصق أو Cloudflare)"); return }
         toast("جارٍ الاختبار... (حتى ١٢ ثانية)")
         Turn.test(this, servers) { _, m ->
-            AlertDialog.Builder(this).setMessage(m).setPositiveButton("حسناً", null).show()
+            AlertDialog.Builder(this).setMessage(m).setPositiveButton("حسناً", null).showStyled()
         }
+    }
+
+    private fun relayField(): EditText = field("https://ntfy.example.com").apply {
+        textSize = 12f; typeface = Typeface.MONOSPACE; textDirection = View.TEXT_DIRECTION_LTR
+        setText(prefs.getString("relay_url", "") ?: "")
+    }
+
+    private fun relayCard(f: EditText): LinearLayout = card("🛰 خادم الوسيط (اختياري)", f,
+        chipRow(
+            chip("📋 لصق") { val t = clipText().trim(); if (t.startsWith("https://")) f.setText(t) else toast("انسخ رابط الخادم (https://...) أولاً") },
+            chip("↩ الافتراضي") { f.setText("") }),
+        label("الخادم المجاني ntfy.sh يحدّ كل جهاز بـ ٢٥٠ رسالة يومياً. خادم ntfy خاص بك يلغي الحد ويزيد الخصوصية. اضبط نفس الرابط على الهاتفين (أو يُنقل برمز QR).", 11.5f, MUTED, false))
+
+    private fun saveRelay(f: EditText) {
+        val u = f.text.toString().trim()
+        prefs.edit().putString("relay_url", u).apply()
+        Relay.set(u)
     }
 
     private fun openUrl(u: String) {
@@ -443,6 +474,8 @@ class MainActivity : Activity() {
                     }),
                 label("يوقظ هاتف الطفل فوراً حتى لو أغلقه نظام الهاتف. يحتاج إعداد Firebase مرة واحدة (SETUP_FCM.md).", 11.5f, MUTED, false)),
             cardLp())
+        relayP = relayField()
+        pc.addView(relayCard(relayP), cardLp())
         statusP = statusBox()
         pc.addView(statusP, cardLp())
         pc.addView(pill("⬅ تغيير دور الهاتف", false) { show(modeScreen) }, cardLp(18))
@@ -473,6 +506,8 @@ class MainActivity : Activity() {
         )
         turnC = turnField()
         cc.addView(card("٤ · خادم TURN (اختياري)", turnC, turnBar(turnC)), cardLp())
+        relayC = relayField()
+        cc.addView(relayCard(relayC), cardLp())
         cc.addView(pill("✅ تفعيل وضع الطفل", true) { onActivateChild() }, cardLp(18))
         cc.addView(
             pill("🔋 استثناء التطبيق من توفير البطارية", false) {
@@ -503,9 +538,12 @@ class MainActivity : Activity() {
         }
         childStandby.addView(standbyMsg, cardLp(16))
         childStandby.addView(
-            label("هذا الهاتف يستقبل نداء الأهل تلقائياً. اترك التطبيق مفتوحاً والهاتف موصولاً بالشاحن.", 11.5f, MUTED, false)
+            label("هذا الهاتف يستقبل نداء الأهل تلقائياً حتى لو أُغلقت الشاشة أو خرجت من التطبيق. اترك الإنترنت شغّالاً.", 11.5f, MUTED, false)
                 .apply { gravity = Gravity.CENTER }, cardLp(18)
         )
+        readyView = label("", 12f, MUTED, false).apply { gravity = Gravity.CENTER }
+        childStandby.addView(readyView, cardLp(10))
+        childStandby.addView(pill("🩺 فحص الجاهزية", false) { showReadiness(false) }, cardLp(10))
         childStandby.addView(pill("⚙️ إيقاف وضع الطفل (PIN)", false) { askPin { leaveChild() } }, cardLp(26))
 
         // ---------- call screen ----------
@@ -618,6 +656,7 @@ class MainActivity : Activity() {
 
         for (v in listOf<View>(modeScreen, parentScreen, childSetup, childStandby, callLayout))
             root.addView(v, FrameLayout.LayoutParams(-1, -1))
+        Fonts.apply(root, this)
         setContentView(root)
     }
 
@@ -666,21 +705,26 @@ class MainActivity : Activity() {
         codes.values.forEach { k ->
             if (parentWatchers.containsKey(k.code)) return@forEach
             val r = Rendezvous(CallCrypto.roomId(k.code), { raw -> handleChildAlert(k, raw) }, { })
-            r.subscribe(System.currentTimeMillis() / 1000 - 1200)   // 20 min back: learns the latest heartbeat
+            r.subscribe(System.currentTimeMillis() / 1000 - 60)
             parentWatchers[k.code] = r
         }
-        if (!tickerOn) { tickerOn = true; watchStartMs = System.currentTimeMillis(); ui.post(seenTick) }
+        if (!tickerOn) {
+            tickerOn = true; watchStartMs = System.currentTimeMillis()
+            autoPings = 0; lastAutoPing = watchStartMs
+            pingAll()
+            tickH.post(seenTick)
+        }
     }
 
     private fun stopParentWatchers() {
         tickerOn = false
-        ui.removeCallbacks(seenTick)
+        tickH.removeCallbacks(seenTick)
         parentWatchers.values.forEach { it.stop() }
         parentWatchers.clear()
     }
 
     private fun handleChildAlert(k: Kid, raw: String) {
-        val t = Regex("SKC1:[A-Za-z0-9_-]+").find(CallCrypto.clean(raw))?.value ?: return
+        val t = Regex("SKC[12]:[A-Za-z0-9_-]+").find(CallCrypto.clean(raw))?.value ?: return
         val p = try { CallCrypto.open(k.code, "msg", null, t, 20 * 60 * 1000L) } catch (_: Exception) { return }
         val f = p.split("|")
         if (f.size < 3 || f[0] != "A" || !seen.add(t)) return
@@ -689,12 +733,18 @@ class MainActivity : Activity() {
                 val ts = f[2].toLongOrNull() ?: 0L
                 if (System.currentTimeMillis() / 1000 - ts < 120) runOnUiThread { alertNotificationsDisabled(k.name) }
             }
-            "hb" -> {
-                val tsMs = (f[2].toLongOrNull() ?: return) * 1000L
+            "alm" -> {
+                val ts = f.getOrNull(3)?.toLongOrNull() ?: 0L
+                if (System.currentTimeMillis() / 1000 - ts < 120) runOnUiThread { toast("✅ وصل المنبه إلى هاتف ${k.name}") }
+            }
+            "pong" -> {
+                val ts = f[2].toLongOrNull() ?: return
+                if (Math.abs(System.currentTimeMillis() / 1000 - ts) > 45) return   // an old answer is not proof
                 val room = CallCrypto.roomId(k.code)
                 val batt = f.getOrNull(3)?.toIntOrNull() ?: -1
-                if (tsMs > prefs.getLong("seen_$room", 0L))
-                    prefs.edit().putLong("seen_$room", tsMs).putInt("batt_$room", batt).apply()
+                val now = System.currentTimeMillis()
+                pongAt[k.code] = now
+                prefs.edit().putLong("seen_$room", now).putInt("batt_$room", batt).apply()
                 runOnUiThread { updateSeenLabels() }
             }
         }
@@ -744,6 +794,7 @@ class MainActivity : Activity() {
             val watchRow = row("📹 صوت وصورة" to { callKid(k, "v") }, "✉️ رسالة" to {
                 askMessage { text -> sendMailboxMsg(k, text) }
             })
+            val quietRow = row("🌙 نظرة هادئة" to { callKid(k, "q") }, "⏰ منبه" to { alarmsDialog(k) })
             val locRow = row("📍 موقعه الآن" to { requestLocation(k, false) }, "📡 تتبع مباشر" to { requestLocation(k, true) })
             val manageRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -758,19 +809,134 @@ class MainActivity : Activity() {
                         .setPositiveButton("حذف") { _, _ ->
                             saveKids(loadKids().filter { it.code != k.code }); refreshParent()
                         }
-                        .setNegativeButton("إلغاء", null).show()
+                        .setNegativeButton("إلغاء", null).showStyled()
                 }, LinearLayout.LayoutParams(0, -2, 1f))
             }
             val seen = label("", 12f, MUTED, false)
             seenLabels[k.code] = seen
-            parentList.addView(card("🧒 ${k.name}", seen, callRow, watchRow, locRow, manageRow), cardLp(10))
+            seen.setOnClickListener { pingKid(k); updateSeenLabels() }
+            parentList.addView(card("🧒 ${k.name}", seen, callRow, watchRow, quietRow, locRow, manageRow), cardLp(10))
         }
         updateSeenLabels()
     }
 
+    // ---------- alarms: set from the parent, rings on the child phone even without internet ----------
+    private fun almKey(k: Kid) = "alm_" + CallCrypto.roomId(k.code)
+
+    private fun loadAlarmList(k: Kid): MutableList<JSONObject> {
+        val out = mutableListOf<JSONObject>()
+        try {
+            val a = JSONArray(prefs.getString(almKey(k), "[]"))
+            val now = System.currentTimeMillis()
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                if (o.optBoolean("r") || o.optLong("w") > now) out.add(o)
+            }
+        } catch (_: Exception) {}
+        return out
+    }
+
+    private fun saveAlarmList(k: Kid, l: List<JSONObject>) {
+        val a = JSONArray()
+        l.forEach { a.put(it) }
+        prefs.edit().putString(almKey(k), a.toString()).apply()
+    }
+
+    private fun alarmsDialog(k: Kid) {
+        val list = loadAlarmList(k)
+        val fmt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US)
+        val items = mutableListOf("➕ منبه جديد")
+        list.forEach { o ->
+            items.add("⏰ " + fmt.format(java.util.Date(o.optLong("w"))) +
+                (if (o.optBoolean("r")) " · كل يوم" else "") +
+                (if (o.optString("l").isNotEmpty()) " · " + o.optString("l") else "") + "   (اضغط للإلغاء)")
+        }
+        AlertDialog.Builder(this).setTitle("منبهات ${k.name}")
+            .setItems(items.toTypedArray<CharSequence>()) { _, i -> if (i == 0) newAlarm(k) else cancelAlarm(k, list[i - 1]) }
+            .setNegativeButton("إغلاق", null).showStyled()
+    }
+
+    private fun newAlarm(k: Kid) {
+        val c = java.util.Calendar.getInstance()
+        android.app.TimePickerDialog(this, { _, h, m -> askAlarmOptions(k, h, m) },
+            c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE),
+            android.text.format.DateFormat.is24HourFormat(this)).show()
+    }
+
+    private fun askAlarmOptions(k: Kid, h: Int, m: Int) {
+        val lbl = field("اسم المنبه (اختياري)").apply { setText("استيقظ") }
+        val daily = CheckBox(this).apply { text = "كرّر كل يوم"; setTextColor(Color.WHITE) }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(10), dp(18), 0)
+            addView(lbl)
+            addView(daily, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(10) })
+        }
+        AlertDialog.Builder(this).setTitle("منبه %02d:%02d".format(h, m)).setView(box)
+            .setPositiveButton("إرسال") { _, _ ->
+                sendAlarm(k, h, m, daily.isChecked, lbl.text.toString().trim().replace("|", " "))
+            }
+            .setNegativeButton("إلغاء", null).showStyled()
+    }
+
+    private fun sendAlarm(k: Kid, h: Int, m: Int, rep: Boolean, label: String) {
+        val c = java.util.Calendar.getInstance()
+        c.set(java.util.Calendar.HOUR_OF_DAY, h); c.set(java.util.Calendar.MINUTE, m)
+        c.set(java.util.Calendar.SECOND, 0); c.set(java.util.Calendar.MILLISECOND, 0)
+        if (c.timeInMillis <= System.currentTimeMillis()) c.add(java.util.Calendar.DAY_OF_MONTH, 1)
+        val id = "%02d%02d".format(h, m)
+        val w = c.timeInMillis
+        val payload = "AL|$id|${System.currentTimeMillis()}|$w|${if (rep) 1 else 0}|$label"
+        Rendezvous(CallCrypto.roomId(k.code), { }, { }).publish(CallCrypto.seal(k.code, "alm", null, payload)) { ok ->
+            runOnUiThread {
+                if (ok) {
+                    val l = loadAlarmList(k).filter { it.optString("id") != id }.toMutableList()
+                    l.add(JSONObject().put("id", id).put("w", w).put("r", rep).put("l", label))
+                    saveAlarmList(k, l)
+                    toast("أُرسل المنبه ✓ يصل الهاتف عند اتصاله بالإنترنت، وبعدها يرنّ حتى بدون إنترنت")
+                    Fcm.wake(prefs.getString("wake_url", "") ?: "", k.code, true)
+                } else toast("تعذّر الإرسال، تحقق من الإنترنت")
+            }
+        }
+    }
+
+    private fun cancelAlarm(k: Kid, o: JSONObject) {
+        val id = o.optString("id")
+        Rendezvous(CallCrypto.roomId(k.code), { }, { })
+            .publish(CallCrypto.seal(k.code, "alm", null, "AC|$id|${System.currentTimeMillis()}")) { ok ->
+                runOnUiThread {
+                    if (ok) {
+                        saveAlarmList(k, loadAlarmList(k).filter { it.optString("id") != id })
+                        toast("أُرسل طلب الإلغاء")
+                    } else toast("تعذّر الإرسال، تحقق من الإنترنت")
+                }
+            }
+    }
+
+    /** Child: a parent's alarm request (kind "alm", valid 12 h so it also works if the phone was offline when sent). */
+    private fun handleAlarmMsg(t: String): Boolean {
+        val p = try { CallCrypto.open(curCode, "alm", null, t, 12 * 3600 * 1000L) } catch (_: Exception) { return false }
+        if (!seen.add(t)) return true
+        val f = p.split("|", limit = 6)
+        val id: String
+        when {
+            f[0] == "AL" && f.size >= 6 -> {
+                id = f[1]
+                Alarms.apply(this, id, f[2].toLongOrNull() ?: 0L, f[3].toLongOrNull() ?: 0L, f[4] == "1", f[5])
+            }
+            f[0] == "AC" && f.size >= 3 -> {
+                id = f[1]
+                Alarms.cancel(this, id, f[2].toLongOrNull() ?: 0L)
+            }
+            else -> return true
+        }
+        rv?.publish(CallCrypto.seal(curCode, "msg", null, "A|alm|$id|${System.currentTimeMillis() / 1000}")) { }
+        return true
+    }
+
     private fun showKidQr(k: Kid) {
         val payload = Qr.encode(k.name, k.code, normalizeTurn(prefs.getString("turn", "") ?: ""),
-            prefs.getString("cf_id", "") ?: "", prefs.getString("cf_tok", "") ?: "")
+            prefs.getString("cf_id", "") ?: "", prefs.getString("cf_tok", "") ?: "", prefs.getString("relay_url", "") ?: "")
         val bmp = try { Qr.bitmap(payload, 720) } catch (e: Exception) { toast("الرمز كبير جداً. قلّل إعدادات TURN"); return }
         val img = ImageView(this).apply {
             setImageBitmap(bmp); setBackgroundColor(Color.WHITE)
@@ -786,6 +952,7 @@ class MainActivity : Activity() {
             .setPositiveButton("إغلاق", null).create()
         d.window?.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         d.show()
+        Fonts.apply(d.window?.decorView, this)
     }
 
     private fun startQrScan() {
@@ -805,6 +972,7 @@ class MainActivity : Activity() {
         if (j == null) { toast("هذا ليس رمز اقتران SecureCall"); return }
         childName.setText(j.optString("n")); childCode.setText(j.optString("c"))
         if (j.has("t")) turnC.setText(j.optString("t"))
+        if (j.has("r")) relayC.setText(j.optString("r"))
         if (j.has("ci") && j.has("ct")) {
             prefs.edit().putString("cf_id", j.optString("ci")).putString("cf_tok", j.optString("ct")).putLong("cf_exp", 0L).apply()
             Turn.cfRefresh(prefs) { _, _ -> }
@@ -812,32 +980,60 @@ class MainActivity : Activity() {
         toast("تم ملء البيانات ✓ أدخل رمز PIN ثم اضغط تفعيل")
     }
 
-    // ---------- parent: is the child phone online? (heartbeat every ~5 min) ----------
+    // ---------- parent: is the child phone really reachable? (live ping/pong, nothing runs in the background) ----------
+    private val pingAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val pongAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private var autoPings = 0
+    private var lastAutoPing = 0L
+
     private val seenTick = object : Runnable {
-        override fun run() { updateSeenLabels(); ui.postDelayed(this, 30000) }
+        override fun run() {
+            updateSeenLabels()
+            val now = System.currentTimeMillis()
+            if (autoPings < 12 && now - lastAutoPing > 150000L) { lastAutoPing = now; autoPings++; pingAll() }
+            tickH.postDelayed(this, 5000)
+        }
     }
 
-    private fun fmtAge(min: Long) = if (min < 60) "$min د" else "${min / 60} س"
+    private fun pingKid(k: Kid) {
+        pingAt[k.code] = System.currentTimeMillis()
+        Rendezvous(CallCrypto.roomId(k.code), { }, { })
+            .publish(CallCrypto.seal(k.code, "msg", null, "PG|${System.currentTimeMillis() / 1000}")) { ok ->
+                if (!ok) { pingAt[k.code] = 1L; runOnUiThread { updateSeenLabels() } }
+            }
+    }
+
+    private fun pingAll() = loadKids().forEach { pingKid(it) }
 
     private fun updateSeenLabels() {
         val now = System.currentTimeMillis()
         loadKids().forEach { k ->
             val room = CallCrypto.roomId(k.code)
-            val ts = prefs.getLong("seen_$room", 0L)
+            val lbl = seenLabels[k.code] ?: return@forEach
+            val ping = pingAt[k.code] ?: 0L
+            val pong = pongAt[k.code] ?: 0L
+            val last = prefs.getLong("seen_$room", 0L)
             val batt = prefs.getInt("batt_$room", -1)
             val bt = if (batt >= 0) " · 🔋 $batt%" else ""
-            val age = if (ts == 0L) -1L else maxOf(0L, (now - ts) / 60000)
-            val lbl = seenLabels[k.code]
+            val lastTxt = if (last > 0) "آخر ظهور " + timeFmt.format(java.util.Date(last)) else "لم يظهر بعد"
+            val limited = if (Relay.limited()) "\n⚠️ وصلت حد رسائل ntfy المجاني (٢٥٠/يوم). انتظر أو استخدم خادماً خاصاً." else ""
             when {
-                ts == 0L -> { lbl?.text = "⚪ لا توجد إشارة بعد (تظهر خلال ٥ دقائق من تشغيل وضع الطفل بنسخة V14)"; lbl?.setTextColor(MUTED) }
-                age < 8 -> { lbl?.text = "🟢 متصل · آخر إشارة قبل ${fmtAge(age)}$bt"; lbl?.setTextColor(ACCENT) }
-                else -> { lbl?.text = "🔴 غير متصل منذ ${fmtAge(age)}$bt"; lbl?.setTextColor(DANGER) }
+                ping == 0L && pong == 0L -> { lbl.text = "⚪ جارٍ فحص الاتصال..."; lbl.setTextColor(MUTED) }
+                ping == 1L -> { lbl.text = "⚠️ تعذّر الفحص (لا إنترنت عندك أو حد الرسائل)$limited"; lbl.setTextColor(DANGER) }
+                pong >= ping && now - pong < 200000L -> {
+                    lbl.text = "🟢 متصل الآن · تأكّد قبل ${(now - pong) / 1000} ث$bt"; lbl.setTextColor(ACCENT)
+                }
+                pong < ping && now - ping > 20000L -> {
+                    lbl.text = "🔴 لا يردّ — $lastTxt$bt\n(اضغط هنا للفحص من جديد)$limited"; lbl.setTextColor(DANGER)
+                }
+                pong < ping -> { lbl.text = "⏳ جارٍ الفحص..."; lbl.setTextColor(MUTED) }
+                else -> { lbl.text = "⚪ آخر تأكّد قبل ${(now - pong) / 60000} د — اضغط هنا للتحديث"; lbl.setTextColor(MUTED) }
             }
-            if (ts != 0L && age >= 15 && now - watchStartMs > 25000L) {
+            if (ping > 1L && pong < ping && now - ping > 20000L && now - watchStartMs > 25000L) {
                 if (offlineAlerted.add(k.code))
-                    postAlert("off_" + k.name, "هاتف ${k.name} غير متصل",
-                        "لم تصل منه إشارة منذ ${fmtAge(age)}. قد لا تصل المكالمة حتى يعود للاتصال بالإنترنت.")
-            } else if (age in 0L..7L) offlineAlerted.remove(k.code)
+                    postAlert("off_" + k.name, "هاتف ${k.name} لا يردّ",
+                        "لم يردّ على فحص الاتصال. قد لا تصل المكالمة حتى يعود للاتصال بالإنترنت أو يُفتح وضع الطفل.")
+            } else if (pong >= ping && pong > 0L) offlineAlerted.remove(k.code)
         }
     }
 
@@ -888,7 +1084,7 @@ class MainActivity : Activity() {
                     type = "text/plain"; putExtra(Intent.EXTRA_TEXT, k.code)
                 }, "مشاركة"))
             }
-            .setNegativeButton("إغلاق", null).show()
+            .setNegativeButton("إغلاق", null).showStyled()
     }
 
     // ---------- permissions / service ----------
@@ -1006,7 +1202,7 @@ class MainActivity : Activity() {
                     toast("رمز PIN غير صحيح")
                 }
             }
-            .setNegativeButton("إلغاء", null).show()
+            .setNegativeButton("إلغاء", null).showStyled()
     }
 
     private fun dim(on: Boolean) {
@@ -1028,6 +1224,7 @@ class MainActivity : Activity() {
             .putString("cname", name).putString("ccode", code)
             .putString("turn", turnC.text.toString()).putBoolean("cactive", true)
             .apply()
+        saveRelay(relayC)
         if (pin.isNotEmpty()) setPin(pin)
         ensurePerms(
             listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
@@ -1060,7 +1257,7 @@ class MainActivity : Activity() {
                 if (needsAutostart) ui.postDelayed({ openAutoStartSettings() }, if (needsBattery) 1200 else 0)
             }
             .setNegativeButton("لاحقًا", null)
-            .show()
+            .showStyled()
     }
 
     private fun requestBatteryExemption() {
@@ -1106,6 +1303,59 @@ class MainActivity : Activity() {
         toast("دوّر على \"بدء تلقائي\" أو \"تشغيل بالخلفية\" في إعدادات هذا التطبيق")
     }
 
+    // ---------- child readiness: everything a call needs while the app is closed ----------
+    private class Gap(val text: String, val fix: () -> Unit)
+
+    private fun readinessGaps(): List<Gap> {
+        val g = mutableListOf<Gap>()
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (!nm.areNotificationsEnabled()) g.add(Gap("الإشعارات مغلقة. على بعض الهواتف (شاومي خصوصاً) يوقف النظام التطبيق معها فلا تصل المكالمات.") {
+            try {
+                startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+            } catch (_: Exception) {}
+        })
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) g.add(Gap("استثناء توفير البطارية غير مفعّل.") { requestBatteryExemption() })
+        if (!Settings.canDrawOverlays(this)) g.add(Gap("«العرض فوق التطبيقات» غير مفعّل. هو الذي يسمح للتطبيق بالفتح عند النداء وهو مغلق.") {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            } catch (_: Exception) {}
+        })
+        if (android.os.Build.VERSION.SDK_INT >= 34 && !nm.canUseFullScreenIntent()) g.add(Gap("إشعارات ملء الشاشة غير مفعّلة.") {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+            } catch (_: Exception) {}
+        })
+        if (android.os.Build.VERSION.SDK_INT >= 29 &&
+            checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED
+        ) g.add(Gap("الموقع «طوال الوقت» غير مفعّل. بدونه لا يُرسل الموقع والتطبيق مغلق.") {
+            try { requestPermissions(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 3) } catch (_: Exception) {}
+        })
+        return g
+    }
+
+    private fun updateReadyLabel() {
+        if (!this::readyView.isInitialized) return
+        val n = readinessGaps().size
+        readyView.text = if (n == 0) "✅ الهاتف جاهز لاستقبال النداء" else "⚠️ $n إعدادات ناقصة قد تمنع وصول المكالمة — اضغط «فحص الجاهزية»"
+        readyView.setTextColor(if (n == 0) ACCENT else DANGER)
+    }
+
+    private fun showReadiness(auto: Boolean) {
+        if (mode != 2) return
+        val gaps = readinessGaps()
+        updateReadyLabel()
+        if (gaps.isEmpty()) { if (!auto) toast("✅ كل شيء جاهز لاستقبال نداء الأهل"); return }
+        val auto2 = autoStartIntent() != null
+        val msg = gaps.joinToString("\n\n") { "⚠️ " + it.text } +
+            (if (auto2) "\n\nوفي هذا الهاتف فعّل أيضاً «التشغيل التلقائي» وثبّت التطبيق في الخلفية." else "")
+        val b = AlertDialog.Builder(this).setTitle("جاهزية استقبال المكالمات").setMessage(msg)
+            .setPositiveButton("إصلاح التالي") { _, _ -> gaps[0].fix() }
+            .setNegativeButton("لاحقاً", null)
+        if (auto2) b.setNeutralButton("التشغيل التلقائي") { _, _ -> openAutoStartSettings() }
+        b.showStyled()
+    }
+
     /** Android 14+: a call-style full-screen notification needs the user's OK in a system screen. */
     private fun maybeAskFullScreen() {
         if (android.os.Build.VERSION.SDK_INT < 34 || !Fcm.available(this)) return
@@ -1120,17 +1370,37 @@ class MainActivity : Activity() {
                     startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
                 } catch (_: Exception) {}
             }
-            .setNegativeButton("لاحقاً", null).show()
+            .setNegativeButton("لاحقاً", null).showStyled()
     }
 
     private fun handleWakeIntent(i: Intent?) {
         val ii = i ?: return
-        if (!ii.getBooleanExtra("wake", false)) return
-        if (android.os.Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
+        val alarm = ii.getStringExtra("alarm")
+        val quiet = ii.getBooleanExtra("quiet", false)
+        if (!ii.getBooleanExtra("wake", false) && alarm == null) return
+        if (quiet && alarm == null) dim(true)          // quiet look: don't light the screen up
+        else if (android.os.Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
         else window.addFlags(
             WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
                 WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD)
-        ii.removeExtra("wake")
+        ii.removeExtra("wake"); ii.removeExtra("quiet"); ii.removeExtra("alarm")
+        if (alarm != null) showAlarmDialog(alarm)
+    }
+
+    private var alarmDlg: AlertDialog? = null
+
+    private fun showAlarmDialog(label: String) {
+        try { alarmDlg?.dismiss() } catch (_: Exception) {}
+        alarmDlg = AlertDialog.Builder(this).setTitle("⏰ منبه من الأهل").setMessage(label)
+            .setCancelable(false)
+            .setPositiveButton("إيقاف") { _, _ -> Alarms.stopRinging(this) }
+            .showStyled()
+    }
+
+    private fun AlertDialog.Builder.showStyled(): AlertDialog {
+        val d = show()
+        Fonts.apply(d.window?.decorView, this@MainActivity)
+        return d
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -1144,8 +1414,9 @@ class MainActivity : Activity() {
         curName = prefs.getString("cname", "") ?: ""
         curCode = prefs.getString("ccode", "") ?: ""
         Fcm.subscribe(this, curCode)
-        maybeAskBackgroundReliability()
-        maybeAskFullScreen()
+        Alarms.scheduleAll(this)
+        ChildListenService.start(this)
+        tickH.postDelayed({ showReadiness(true) }, 800)
         requestUninstallProtection()
         dim(true)
         standbyTitle.text = "هاتف $curName"
@@ -1161,6 +1432,7 @@ class MainActivity : Activity() {
             if (dpm.isAdminActive(admin)) dpm.removeActiveAdmin(admin)
         } catch (_: Exception) {}
         Fcm.unsubscribe(this, prefs.getString("ccode", "") ?: "")
+        ChildListenService.stop(this)
         prefs.edit().putBoolean("cactive", false).apply()
         resetCall()
         inSession = false
@@ -1176,7 +1448,7 @@ class MainActivity : Activity() {
         myId = newId()
         val r = newMailbox(curCode)
         rv = r
-        r.subscribe(System.currentTimeMillis() / 1000)
+        r.subscribe(System.currentTimeMillis() / 1000 - 6 * 3600)   // also picks up alarms sent while offline
         status("")
     }
 
@@ -1205,14 +1477,15 @@ class MainActivity : Activity() {
 
     // ---------- parent: start a call ----------
     private fun callKid(k: Kid, type: String) {
-        curName = k.name; curCode = k.code; callType = type; wantVideo = type == "v"
+        curName = k.name; curCode = k.code; callType = type; wantVideo = type == "v" || type == "q"
         prefs.edit().putString("turn", turnP.text.toString()).putString("wake_url", wakeUrl.text.toString().trim()).apply()
+        saveRelay(relayP)
         stopLocWatch(false)
         val go = {
             ensurePerms(listOf(Manifest.permission.RECORD_AUDIO)) {
                 startCallService(false)
                 startParentCall()
-                Fcm.wake(prefs.getString("wake_url", "") ?: "", k.code)   // wake-up bell, in parallel with the normal request
+                Fcm.wake(prefs.getString("wake_url", "") ?: "", k.code, type == "q")   // wake-up bell, in parallel with the normal request
             }
         }
         if (Turn.cfConfigured(prefs) && Turn.cfCached(prefs).isEmpty()) {
@@ -1237,7 +1510,8 @@ class MainActivity : Activity() {
         rv = r
         r.subscribe(System.currentTimeMillis() / 1000 - 5)
         sendHello(parentHello())
-        ui.postDelayed(helloTick, 15000)
+        helloN = 0
+        ui.postDelayed(helloTick, 3000)
         status("جارٍ الاتصال بهاتف $curName ...")
     }
 
@@ -1260,10 +1534,17 @@ class MainActivity : Activity() {
                 endCallUi("لم يردّ هاتف $curName. تأكد أنه متصل بالإنترنت وأن التطبيق يعمل بوضع الطفل.")
                 return
             }
+            if (Relay.limited()) {
+                endCallUi("وصلت حد رسائل خدمة ntfy المجانية (٢٥٠ يومياً). انتظر قليلاً أو اضبط خادم وسيط خاصاً من بطاقة «خادم الوسيط».")
+                return
+            }
             sendHello(parentHello())
-            ui.postDelayed(this, 15000)
+            ui.postDelayed(this, helloDelays.getOrElse(helloN++) { 15000L })
         }
     }
+    private var helloN = 0
+    /** Early retries are quick (the child may still be waking up), later ones are spaced out. */
+    private val helloDelays = longArrayOf(3000, 5000, 7000, 10000, 10000, 15000)
 
     /** Child phone only: every 20 s, checks whether the child has turned the app's notifications
      *  off from system Settings (their right — this never re-enables them or blocks that choice)
@@ -1281,17 +1562,12 @@ class MainActivity : Activity() {
                     lastNotifAlertMs = now
                 }
                 notifWasEnabled = enabled
-                val r = rv
-                if (r != null && now - lastHbMs > 5 * 60 * 1000L) {
-                    lastHbMs = now
-                    r.publish(CallCrypto.seal(curCode, "msg", null, "A|hb|${now / 1000}|${batteryPct()}")) { }
-                }
             }
             if (Turn.cfNeedsRefresh(prefs) && !cfBusy && System.currentTimeMillis() - lastCfTry > 10 * 60 * 1000L) {
                 cfBusy = true; lastCfTry = System.currentTimeMillis()
                 Turn.cfRefresh(prefs) { _, _ -> cfBusy = false }
             }
-            ui.postDelayed(this, 20000)
+            tickH.postDelayed(this, 20000)
         }
     }
 
@@ -1331,6 +1607,16 @@ class MainActivity : Activity() {
         return e
     }
 
+    /** Sends a setup code; retries twice (2.5 s apart) before giving up, so one lost request doesn't kill the call. */
+    private fun publishRetry(blob: String, tries: Int = 3, fail: () -> Unit) {
+        val r = rv ?: return
+        r.publish(blob) { ok ->
+            if (ok) return@publish
+            if (tries > 1) ui.postDelayed({ publishRetry(blob, tries - 1, fail) }, 2500)
+            else runOnUiThread { fail() }
+        }
+    }
+
     private fun becomeCaller() {
         status("وجدت هاتف $curName، جارٍ تجهيز المكالمة...")
         val keep = rv
@@ -1346,9 +1632,7 @@ class MainActivity : Activity() {
             if (blob.length > 4000) {
                 status("رمز الإعداد أطول من الحد المسموح. أضف خادم TURN وجرّب مرة أخرى.")
             } else {
-                rv?.publish(blob) { ok ->
-                    runOnUiThread { if (!ok) status("تعذّر الإرسال عبر الإنترنت. تحقق من الاتصال.") }
-                }
+                publishRetry(blob) { status("تعذّر الإرسال عبر الإنترنت. تحقق من الاتصال.") }
             }
         }, { m -> status("خطأ: $m") })
     }
@@ -1357,7 +1641,7 @@ class MainActivity : Activity() {
         val bind = CallCrypto.digest(t)
         val keep = rv
         rv = null
-        val e = beginEngine(2, wantVideo, false, callType == "l")
+        val e = beginEngine(2, wantVideo, false, callType == "l" || callType == "q")
         rv = keep
         if (e == null) return
         auto = true
@@ -1369,17 +1653,16 @@ class MainActivity : Activity() {
             if (blob.length > 4000) {
                 status("الرد أطول من الحد المسموح. أضف خادم TURN على الهاتفين.")
             } else {
-                rv?.publish(blob) { ok ->
-                    runOnUiThread { if (!ok) status("تعذّر إرسال الرد. تحقق من الاتصال بالإنترنت.") }
-                }
+                publishRetry(blob) { status("تعذّر إرسال الرد. تحقق من الاتصال بالإنترنت.") }
             }
         }, { m -> status("خطأ: $m") })
     }
 
     /** A message arrived from the mailbox. Anything that does not decrypt with the pairing code is ignored. */
     private fun onRemote(msg: String) {
-        val t = Regex("SKC1:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
-        if (mode == 2 && handleLocReq(t)) return
+        val t = Regex("SKC[12]:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
+        if (mode == 2 && !ChildListenService.running && handleLocReq(t)) return
+        if (mode == 2 && !ChildListenService.running && handleAlarmMsg(t)) return
         if (callLayout.visibility == View.VISIBLE) return
         val code = curCode
 
@@ -1425,7 +1708,7 @@ class MainActivity : Activity() {
                 waitingOffer = true
                 parentId = f[1]
                 callType = f[3]
-                wantVideo = callType == "v"
+                wantVideo = callType == "v" || callType == "q"
                 startCallService(true)   // notification appears only now, for the real call
                 sendHello("C|$myId|$curName|$parentId")
                 ui.postDelayed(pairTimeout, 45000)
@@ -1434,6 +1717,13 @@ class MainActivity : Activity() {
             }
             if (waitingOffer) {
                 if (t == lastHandled) return
+                // the parent repeats its request when our answer was lost: answer again instead of ignoring it
+                val hp = try { CallCrypto.open(code, "hello", null, t, 90 * 1000L) } catch (_: Exception) { null }
+                if (hp != null) {
+                    val hf = hp.split("|")
+                    if (hf.size >= 4 && hf[0] == "P" && hf[1] == parentId && seen.add(t)) sendHello("C|$myId|$curName|$parentId")
+                    return
+                }
                 val sdp = try { CallCrypto.open(code, "offer", null, t, 3 * 60 * 1000L) } catch (_: Exception) { return }
                 waitingOffer = false
                 answerOffer(t, sdp)
@@ -1446,12 +1736,12 @@ class MainActivity : Activity() {
         ui.removeCallbacksAndMessages(null)
         if (mode == 1) { rv?.stop(); rv = null }
         show(callLayout)
-        dim(false)
+        dim(mode == 2 && callType == "q")   // quiet look: the child's screen stays dark
         loudCount = 0
         msgView.visibility = View.GONE
         if (mode == 1) {
             bar.visibility = View.VISIBLE
-            baseTitle = if (callType == "l") "👂 استماع لهاتف $peerName" else "📱 هاتف $peerName"
+            baseTitle = when (callType) { "l" -> "👂 استماع لهاتف $peerName"; "q" -> "🌙 نظرة هادئة على $peerName"; else -> "📱 هاتف $peerName" }
             titleView.text = baseTitle
             camBanner.visibility = View.GONE
             localView.visibility = View.GONE
@@ -1465,16 +1755,19 @@ class MainActivity : Activity() {
             remoteVideoOn = wantVideo
             remoteBack = false
             vidBtn.text = if (wantVideo) "🎥" else "🚫"
+            if (callType == "q") ui.postDelayed({ if (callType == "q" && callLayout.visibility == View.VISIBLE) hangup() }, 30000)
         } else {
             bar.visibility = View.GONE
-            baseTitle = if (callType == "l") "👂 الأهل يستمعون إليك" else "👨‍👩‍👧 الأهل على الخط"
+            baseTitle = when (callType) { "l" -> "👂 الأهل يستمعون إليك"; "q" -> "🌙 الأهل يلقون نظرة عليك"; else -> "👨‍👩‍👧 الأهل على الخط" }
             titleView.text = baseTitle
             camBanner.visibility = if (wantVideo) View.VISIBLE else View.GONE
             localView.visibility = if (wantVideo) View.VISIBLE else View.GONE
             diagView.visibility = View.GONE
             levelView.visibility = View.GONE
-            buzz(400)
-            notifyChild(baseTitle, if (wantVideo) "الكاميرا تعمل الآن" else "الميكروفون يعمل")
+            if (callType != "q") {   // quiet look: no sound/vibration; the banner + notification stay visible
+                buzz(400)
+                notifyChild(baseTitle, if (wantVideo) "الكاميرا تعمل الآن" else "الميكروفون يعمل")
+            }
         }
     }
 
@@ -1531,7 +1824,7 @@ class MainActivity : Activity() {
         r.publish(CallCrypto.seal(k.code, "lreq", null, "Q|$locReqId|" + (if (live) "live" else "once")), ok)
         locView.text = "📍 جارٍ طلب موقع ${k.name}... (يصل إن كان هاتفه متصلاً بالإنترنت)"
         locCard.visibility = View.VISIBLE
-        bg.postDelayed({ stopLocWatch(false); if (lastLat == 0.0 && lastLon == 0.0) locView.text = "لم يصل موقع ${k.name}. تأكد أن هاتفه متصل بالإنترنت وفي وضع الطفل." },
+        bg.postDelayed({ stopLocWatch(false); if (lastLat == 0.0 && lastLon == 0.0) locView.text = "لم يصل موقع ${k.name}. " + (if (Relay.limited()) "وصلت حد رسائل ntfy المجاني (٢٥٠/يوم)." else "تأكد أن هاتفه متصل بالإنترنت وأن وضع الطفل مفعّل (واضغط «فحص الجاهزية» عنده).") },
             if (live) 11 * 60 * 1000L else 60 * 1000L)
     }
 
@@ -1547,7 +1840,7 @@ class MainActivity : Activity() {
     }
 
     private fun onLocMsg(msg: String) {
-        val t = Regex("SKC1:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
+        val t = Regex("SKC[12]:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
         val k = locKid ?: return
         val p = try { CallCrypto.open(k.code, "lres", null, t, 5 * 60 * 1000L) } catch (_: Exception) { return }
         if (!seen.add(t)) return
@@ -1691,9 +1984,9 @@ class MainActivity : Activity() {
                         val t = et.text.toString().trim().replace("|", " ").take(200)
                         if (t.isNotEmpty()) onSend(t)
                     }
-                    .setNegativeButton("إلغاء", null).show()
+                    .setNegativeButton("إلغاء", null).showStyled()
             }
-        }.show()
+        }.showStyled()
     }
 
     /** Parent, no call running: the message goes through the encrypted mailbox to the waiting child phone. */
@@ -1798,6 +2091,8 @@ class MainActivity : Activity() {
     override fun onPause() {
         if (!svcOn) engine?.pauseCamera()
         if (this::wakeUrl.isInitialized) prefs.edit().putString("wake_url", wakeUrl.text.toString().trim()).apply()
+        if (this::relayP.isInitialized) saveRelay(relayP)
+        childVisible = false
         stopParentWatchers()
         super.onPause()
     }
@@ -1805,6 +2100,7 @@ class MainActivity : Activity() {
         super.onResume()
         engine?.resumeCamera()
         if (mode == 1) startParentWatchers()
+        if (mode == 2) { childVisible = true; updateReadyLabel() }
     }
 
     @Deprecated("Deprecated in Java")
@@ -1821,6 +2117,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         stopCallService()
         ui.removeCallbacksAndMessages(null)
+        tickH.removeCallbacksAndMessages(null)
         stopParentWatchers()
         rv?.stop(); rv = null
         engine?.close(); engine = null

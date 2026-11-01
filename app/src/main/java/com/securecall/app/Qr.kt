@@ -13,10 +13,11 @@ import org.json.JSONObject
 object Qr {
     private const val PREFIX = "SCQR1:"
 
-    fun encode(name: String, code: String, turn: String, cfId: String, cfTok: String): String {
+    fun encode(name: String, code: String, turn: String, cfId: String, cfTok: String, relay: String = ""): String {
         val j = JSONObject().put("n", name).put("c", code)
         if (turn.isNotBlank()) j.put("t", turn)
         if (cfId.isNotBlank() && cfTok.isNotBlank()) { j.put("ci", cfId); j.put("ct", cfTok) }
+        if (relay.startsWith("https://")) j.put("r", relay)
         return PREFIX + Base64.encodeToString(j.toString().toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
     }
 

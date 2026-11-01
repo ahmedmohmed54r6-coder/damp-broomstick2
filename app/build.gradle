@@ -9,8 +9,8 @@ android {
         applicationId "com.securecall.app"
         minSdk 24
         targetSdk 34
-        versionCode 15
-        versionName "2.4"
+        versionCode 17
+        versionName "2.6"
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
     }
     buildTypes { release { minifyEnabled false } }
@@ -34,3 +34,23 @@ dependencies {
 if (file('google-services.json').exists()) {
     apply plugin: 'com.google.gms.google-services'
 }
+
+// Arabic UI font: Noto Naskh Arabic (SIL OFL 1.1), downloaded once at build time into assets/fonts/.
+// If the download fails the app still builds and falls back to the system serif (Naskh on most phones).
+def naskhFile = file('src/main/assets/fonts/naskh.ttf')
+tasks.register('downloadNaskh') {
+    outputs.file(naskhFile)
+    doLast {
+        if (naskhFile.exists() && naskhFile.length() > 50000) return
+        try {
+            naskhFile.parentFile.mkdirs()
+            def tmp = new File(naskhFile.parentFile, 'naskh.tmp')
+            new URL('https://raw.githubusercontent.com/google/fonts/main/ofl/notonaskharabic/NotoNaskhArabic%5Bwght%5D.ttf')
+                .withInputStream { i -> tmp.withOutputStream { o -> o << i } }
+            if (tmp.length() > 50000) tmp.renameTo(naskhFile) else tmp.delete()
+        } catch (Exception e) {
+            logger.warn("Naskh font download failed (${e.message}); using the system font")
+        }
+    }
+}
+tasks.matching { it.name == 'preBuild' }.configureEach { dependsOn 'downloadNaskh' }

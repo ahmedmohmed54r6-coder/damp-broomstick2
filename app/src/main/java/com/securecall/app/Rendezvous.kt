@@ -9,6 +9,21 @@ import java.net.URL
  * (offer/answer); it never sees audio, video, or the shared code. The room name is a hash of the
  * shared code, so only the two people who know the code can find it.
  */
+/** Which mailbox server is used, and whether the free server's daily message cap (250/day) was hit. */
+object Relay {
+    @Volatile var base = "https://ntfy.sh/"
+    @Volatile var limitedAt = 0L
+
+    fun load(p: android.content.SharedPreferences) { set(p.getString("relay_url", "") ?: "") }
+
+    fun set(url: String) {
+        val u = url.trim()
+        base = if (u.startsWith("https://")) (if (u.endsWith("/")) u else "$u/") else "https://ntfy.sh/"
+    }
+
+    fun limited() = System.currentTimeMillis() - limitedAt < 10 * 60 * 1000L
+}
+
 class Rendezvous(
     private val room: String,
     private val onMessage: (String) -> Unit,
@@ -17,7 +32,7 @@ class Rendezvous(
     @Volatile private var stopped = false
     @Volatile private var conn: HttpURLConnection? = null
     private var thread: Thread? = null
-    private val base = "https://ntfy.sh/"
+    private val base: String get() = Relay.base
 
     fun publish(blob: String, done: (Boolean) -> Unit) {
         Thread {
@@ -30,7 +45,9 @@ class Rendezvous(
                 c.doOutput = true
                 c.setRequestProperty("Content-Type", "text/plain; charset=utf-8")
                 c.outputStream.use { it.write(blob.toByteArray()) }
-                ok = c.responseCode in 200..299
+                val code = c.responseCode
+                ok = code in 200..299
+                if (code == 429) Relay.limitedAt = System.currentTimeMillis()
                 c.disconnect()
             } catch (_: Exception) {
             }
@@ -49,7 +66,9 @@ class Rendezvous(
                     conn = c
                     c.connectTimeout = 10000
                     c.readTimeout = 90000
-                    if (c.responseCode !in 200..299) throw RuntimeException("HTTP " + c.responseCode)
+                    val rc = c.responseCode
+                    if (rc == 429) Relay.limitedAt = System.currentTimeMillis()
+                    if (rc !in 200..299) throw RuntimeException("HTTP " + rc)
                     failures = 0
                     c.inputStream.bufferedReader().use { r ->
                         while (!stopped) {

@@ -19,7 +19,7 @@ exports.wake = onRequest({ maxInstances: 5, cors: false }, async (req, res) => {
   try {
     await getMessaging().send({
       topic: room,
-      data: { w: "1", t: String(now) },
+      data: { w: "1", t: String(now), q: req.body.silent === true ? "1" : "0" },
       android: { priority: "high", ttl: 60000 },
     });
     return res.status(200).send("ok");

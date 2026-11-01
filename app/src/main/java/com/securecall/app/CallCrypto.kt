@@ -64,27 +64,97 @@ object CallCrypto {
     private fun aad(kind: String, bind: ByteArray?): ByteArray =
         ("SKC1|" + kind).toByteArray() + (bind ?: ByteArray(0))
 
+    private const val PREFIX2 = "SKC2:"
+    private const val PAD = 256
+
+    /** HKDF-SHA256 (RFC 5869): fresh random salt per message, kind-specific info. */
+    private fun hkdf2(code: String, salt: ByteArray, kind: String): ByteArray {
+        val prk = hmac(salt, normalize(code).toByteArray())
+        val k = hmac(prk, ("SecureCall-v2|key|$kind").toByteArray() + byteArrayOf(1))
+        Arrays.fill(prk, 0)
+        return k
+    }
+
+    private fun aad2(kind: String, bind: ByteArray?, salt: ByteArray): ByteArray =
+        ("SKC2|" + kind).toByteArray() + (bind ?: ByteArray(0)) + salt
+
+    /**
+     * v2 message: base64( salt16 | iv12 | AES-256-GCM( ts8 | len4 | gzip | zero padding to 256 B ) ).
+     * A new key per message (HKDF with a random salt), the kind and the binding are authenticated, and
+     * padding hides the real length of the payload from anyone watching the relay.
+     */
     fun seal(code: String, kind: String, bind: ByteArray?, sdp: String): String {
         val bos = ByteArrayOutputStream()
         GZIPOutputStream(bos).use { it.write(sdp.toByteArray()) }
-        val ts = ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array()
-        val plain = ts + bos.toByteArray()
+        val gz = bos.toByteArray()
+        val need = 8 + 4 + gz.size
+        val plain = ByteArray(((need + PAD - 1) / PAD) * PAD)
+        val bb = ByteBuffer.wrap(plain)
+        bb.putLong(System.currentTimeMillis()); bb.putInt(gz.size); bb.put(gz)
+        val salt = ByteArray(16).also { rnd.nextBytes(it) }
         val iv = ByteArray(12).also { rnd.nextBytes(it) }
-        val key = deriveKey(code)
+        val key = hkdf2(code, salt, kind)
         try {
             val c = Cipher.getInstance("AES/GCM/NoPadding")
             c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-            c.updateAAD(aad(kind, bind))
+            c.updateAAD(aad2(kind, bind, salt))
             val ct = c.doFinal(plain)
-            return PREFIX + Base64.encodeToString(iv + ct, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+            return PREFIX2 + Base64.encodeToString(salt + iv + ct, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
         } finally {
             Arrays.fill(key, 0); Arrays.fill(plain, 0)
+        }
+    }
+
+    private fun gunzipLimited(gz: ByteArray): String {
+        val out = ByteArrayOutputStream()
+        GZIPInputStream(ByteArrayInputStream(gz)).use { zin ->
+            val buf = ByteArray(4096)
+            while (true) {
+                val n = zin.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, n)
+                require(out.size() <= 200_000) { "too large" }
+            }
+        }
+        return String(out.toByteArray())
+    }
+
+    private fun openV2(code: String, kind: String, bind: ByteArray?, b: String, maxAgeMs: Long): String {
+        val raw = Base64.decode(b.removePrefix(PREFIX2), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        require(raw.size > 16 + 12 + 16 + 12) { "too short" }
+        val salt = raw.copyOfRange(0, 16)
+        val iv = raw.copyOfRange(16, 28)
+        val key = hkdf2(code, salt, kind)
+        val plain: ByteArray
+        try {
+            val c = Cipher.getInstance("AES/GCM/NoPadding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+            c.updateAAD(aad2(kind, bind, salt))
+            plain = c.doFinal(raw, 28, raw.size - 28)
+        } finally {
+            Arrays.fill(key, 0)
+        }
+        try {
+            val bb = ByteBuffer.wrap(plain)
+            val ts = bb.long
+            val len = bb.int
+            require(Math.abs(System.currentTimeMillis() - ts) < maxAgeMs) { "expired" }
+            require(len in 1..(plain.size - 12)) { "bad length" }
+            return gunzipLimited(plain.copyOfRange(12, 12 + len))
+        } finally {
+            Arrays.fill(plain, 0)
         }
     }
 
     /** Throws on a wrong code, a tampered/foreign message, a wrong kind/binding, or an expired message. */
     fun open(code: String, kind: String, bind: ByteArray?, blob: String, maxAgeMs: Long = MAX_AGE_MS): String {
         val b = clean(blob)
+        if (b.startsWith(PREFIX2)) return openV2(code, kind, bind, b, maxAgeMs)
+        return openV1(code, kind, bind, b, maxAgeMs)
+    }
+
+    /** Legacy SKC1 messages (old app versions) are still readable; everything we send is SKC2. */
+    private fun openV1(code: String, kind: String, bind: ByteArray?, b: String, maxAgeMs: Long): String {
         require(b.startsWith(PREFIX)) { "bad format" }
         val raw = Base64.decode(b.removePrefix(PREFIX), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
         require(raw.size > 12 + 16 + 8) { "too short" }
