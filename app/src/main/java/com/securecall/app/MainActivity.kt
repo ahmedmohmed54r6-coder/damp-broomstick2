@@ -30,6 +30,7 @@ import android.view.View
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.widget.*
+import com.google.zxing.integration.android.IntentIntegrator
 import org.json.JSONArray
 import org.json.JSONObject
 import org.webrtc.EglBase
@@ -63,10 +64,10 @@ class MainActivity : Activity() {
     private lateinit var childPin: EditText
     private lateinit var turnP: EditText
     private lateinit var turnC: EditText
-    private lateinit var cfIdP: EditText
-    private lateinit var cfTokP: EditText
-    private lateinit var cfIdC: EditText
-    private lateinit var cfTokC: EditText
+    private lateinit var wakeUrl: EditText
+    private lateinit var readyView: TextView
+    private lateinit var relayP: EditText
+    private lateinit var relayC: EditText
     private lateinit var statusP: TextView
     private lateinit var standbyTitle: TextView
     private lateinit var standbyStatus: TextView
@@ -84,10 +85,17 @@ class MainActivity : Activity() {
 
     /** Encrypted at rest (AES-256-GCM, AndroidX Security, key held in the hardware Keystore) —
      *  this is where the pairing code (the master secret), child name and PIN hash live, so a
-     *  plain root/backup file read on the device no longer exposes them in clear text. Shared
-     *  with ChildFcmService via SecurePrefs so both read/write the exact same store. */
-    private val prefs by lazy { SecurePrefs.get(this) }
+     *  plain root/backup file read on the device no longer exposes them in clear text. Falls back
+     *  to a normal file only if the Keystore itself is unavailable (very old/broken devices). */
+    private val prefs by lazy { Store.prefs(this) }
+    companion object {
+        /** True while the child's app is on screen (the background listener then leaves calls to the app). */
+        @Volatile var childVisible = false
+    }
+
     private val ui = Handler(Looper.getMainLooper())
+    /** Periodic ticks live here, NOT in [ui]: resetCall()/showCall() clear every callback of [ui]. */
+    private val tickH = Handler(Looper.getMainLooper())
 
     private var mode = 0                // 1 = parent, 2 = child
     private var engine: CallEngine? = null
@@ -135,6 +143,13 @@ class MainActivity : Activity() {
     private var waitStart = 0L
     private val seen = mutableSetOf<String>()
     private var svcOn = false
+    private var lastHbMs = 0L
+    private var cfBusy = false
+    private var lastCfTry = 0L
+    private val seenLabels = mutableMapOf<String, TextView>()
+    private val offlineAlerted = mutableSetOf<String>()
+    private var tickerOn = false
+    private var watchStartMs = 0L
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -147,30 +162,39 @@ class MainActivity : Activity() {
         ) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
 
         mode = prefs.getInt("mode", 0)
+        val savedChildCode = prefs.getString("ccode", "") ?: ""
+        // V17 removed cactive and FCM subscription on exit but kept ccode. Treat that saved
+        // pairing as durable so the first V18 launch restores background reception automatically.
+        if (savedChildCode.isNotBlank() && !prefs.getBoolean("cpaired", false)) {
+            prefs.edit().putBoolean("cpaired", true).apply()
+            Fcm.subscribe(this, savedChildCode)
+            ChildListenService.start(this)
+        } else if (prefs.getBoolean("cpaired", false) && savedChildCode.isNotBlank()) {
+            Fcm.subscribe(this, savedChildCode)
+            ChildListenService.start(this)
+        }
+        val wakeLaunch = intent?.getBooleanExtra("wake", false) == true
+        val childPaired = prefs.getBoolean("cpaired", false) || savedChildCode.isNotBlank()
         when {
+            wakeLaunch && childPaired -> {
+                val backgroundWake = !prefs.getBoolean("cactive", false)
+                if (hasPerms(listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))) {
+                    activateChild(backgroundWake = backgroundWake)
+                } else {
+                    ensurePerms(listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)) {
+                        activateChild(backgroundWake = backgroundWake)
+                    }
+                }
+            }
             mode == 2 && prefs.getBoolean("cactive", false) &&
                 hasPerms(listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)) -> activateChild()
             mode == 1 -> { refreshParent(); show(parentScreen); startParentWatchers() }
             mode == 2 -> show(childSetup)
             else -> show(modeScreen)
         }
-        ui.postDelayed(notifWatchTick, 20000)
+        Relay.load(prefs)
         handleWakeIntent(intent)
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        handleWakeIntent(intent)
-    }
-
-    /** CallWake already confirmed (by reading the mailbox itself) that a real parent call request
-     *  is waiting, and passes just the two non-sensitive fields needed to start answering it. */
-    private fun handleWakeIntent(i: Intent) {
-        val pid = i.getStringExtra("wake_parentId") ?: return
-        val typ = i.getStringExtra("wake_type") ?: "a"
-        i.removeExtra("wake_parentId")
-        if (mode == 2 && prefs.getBoolean("cactive", false) && !inSession) beginIncomingCall(pid, typ)
+        tickH.postDelayed(notifWatchTick, 20000)
     }
 
     // ---------- design ----------
@@ -198,12 +222,14 @@ class MainActivity : Activity() {
     private fun label(t: String, size: Float, color: Int, bold: Boolean): TextView =
         TextView(this).apply {
             text = t; textSize = size; setTextColor(color)
+            Fonts.get(context)?.let { typeface = it }
             if (bold) setTypeface(typeface, Typeface.BOLD)
         }
 
     private fun pill(t: String, primary: Boolean, onClick: () -> Unit): TextView =
         TextView(this).apply {
             text = t; textSize = 15f; gravity = Gravity.CENTER
+            Fonts.get(context)?.let { typeface = it }
             setTextColor(if (primary) Color.parseColor("#04141A") else Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)
             setPadding(dp(16), dp(14), dp(16), dp(14))
@@ -228,6 +254,7 @@ class MainActivity : Activity() {
     private fun field(hintText: String): EditText =
         EditText(this).apply {
             hint = hintText; setHintTextColor(MUTED); setTextColor(Color.WHITE)
+            Fonts.get(context)?.let { typeface = it }
             textSize = 14f
             background = rounded(FIELD, 14, STROKE)
             setPadding(dp(14), dp(12), dp(14), dp(12))
@@ -273,41 +300,134 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Public, no-signup TURN relays. Tapping fills the field — nothing to type or create an
-     *  account for. Important to say plainly: the call audio/video itself stays end-to-end
-     *  encrypted (DTLS-SRTP) either way, so these relays can't see or hear the call — but when a
-     *  direct connection isn't possible, your traffic's *metadata* (that a connection exists,
-     *  its timing, IP addresses) passes through that third party's servers. Open Relay (Metered.ca)
-     *  is a well-known free community relay; MirOTalk's turn.yani.ovh is a similar alternative. */
-    private fun turnPresetsRow(target: EditText): LinearLayout {
-        val presets = listOf(
-            "Open Relay (مجاني)" to "turn:openrelay.metered.ca:443,openrelayproject,openrelayproject",
-            "Open Relay (TCP)" to "turn:openrelay.metered.ca:443?transport=tcp,openrelayproject,openrelayproject",
-            "بديل (MirOTalk)" to "turn:turn.yani.ovh:3478,webrtc,turnserver"
-        )
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            presets.forEachIndexed { i, (label, value) ->
-                addView(pill(label, false) { target.setText(value) },
-                    LinearLayout.LayoutParams(0, -2, 1f).apply { if (i < presets.size - 1) marginEnd = dp(6) })
-            }
-        }
-    }
-
-    private fun saveCfCreds(idF: EditText, tokF: EditText) {
-        val id = idF.text.toString().trim(); val tok = tokF.text.toString().trim()
-        prefs.edit().putString("cf_id", id).putString("cf_tok", tok).apply()
-        if (id.isEmpty() || tok.isEmpty()) { toast("حُفظ (فاضي = تعطيل Cloudflare)"); return }
-        toast("جارٍ التحقق من بيانات Cloudflare...")
-        Turn.cfRefresh(prefs) { ok, msg -> runOnUiThread { toast(if (ok) "تم ✅ Cloudflare TURN جاهز" else msg) } }
-    }
-
     private fun turnField(): EditText = field("turn:host:3478,user,pass").apply {
         textSize = 12f
+        minLines = 2; maxLines = 5
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         typeface = Typeface.MONOSPACE
         textDirection = View.TEXT_DIRECTION_LTR
         setText(prefs.getString("turn", "") ?: "")
     }
+
+    private fun chip(t: String, onClick: () -> Unit): TextView = pill(t, false, onClick).apply {
+        textSize = 12f; setPadding(dp(6), dp(11), dp(6), dp(11))
+    }
+
+    private fun chipRow(vararg chips: View): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        chips.forEachIndexed { i, c ->
+            addView(c, LinearLayout.LayoutParams(0, -2, 1f).apply { if (i > 0) marginStart = dp(6) })
+        }
+    }
+
+    private fun clipText(): String {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        return cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
+    }
+
+    /** One-tap helpers under the TURN field: paste (iceServers JSON or "url,user,pass" lines), free
+     *  sign-up pages, Cloudflare auto-renewal, a real relay test, and copy to the other phone. */
+    private fun turnBar(target: EditText): LinearLayout {
+        val paste = chip("📋 لصق") {
+            val norm = normalizeTurn(clipText())
+            if (norm.isEmpty()) toast("الحافظة لا تحتوي إعداد TURN. انسخه من لوحة المزوّد ثم اضغط لصق.")
+            else { target.setText(norm); toast("تم ضبط خادم TURN ✓ — اضغط اختبار للتأكد") }
+        }
+        val copyB = chip("📤 نسخ") {
+            val t = normalizeTurn(target.text.toString())
+            if (t.isEmpty()) toast("لا يوجد إعداد لنسخه") else copy(t)
+        }
+        val clear = chip("🗑 مسح") { target.setText("") }
+        val metered = chip("☁ Metered مجاني") { openUrl("https://dashboard.metered.ca/signup") }
+        val cf = chip("☁ Cloudflare تلقائي") { cloudflareDialog() }
+        val test = chip("🧪 اختبار") { testTurn(target) }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(chipRow(paste, copyB, clear))
+            addView(chipRow(metered, cf, test), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+            addView(label("Metered: أنشئ حساباً مجانياً، انسخ iceServers، ثم «لصق». Cloudflare: أدخل المعرّف والتوكن مرة واحدة " +
+                "فيجدّد التطبيق البيانات تلقائياً. «اختبار» يتأكد أن الخادم يعطي مسار relay فعلاً.", 11f, MUTED, false),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            val cfOn = Turn.cfConfigured(prefs)
+            if (cfOn) addView(label("☁ Cloudflare التلقائي مفعّل ✓", 11f, ACCENT, true),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        }
+    }
+
+    private fun cloudflareDialog() {
+        fun mono(hint: String) = field(hint).apply {
+            textSize = 12f; typeface = Typeface.MONOSPACE; textDirection = View.TEXT_DIRECTION_LTR
+        }
+        val idF = mono("Turn Token ID").apply { setText(prefs.getString("cf_id", "") ?: "") }
+        val tkF = mono("API Token").apply {
+            setText(prefs.getString("cf_tok", "") ?: "")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(10), dp(18), 0)
+            addView(label("أنشئ «TURN key» في لوحة Cloudflare (Realtime ← TURN) والصق المعرّف والتوكن هنا. " +
+                "يجدّد التطبيق بيانات TURN القصيرة العمر تلقائياً كل يوم.", 12f, MUTED, false))
+            addView(idF, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+            addView(tkF, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Cloudflare TURN (تلقائي)")
+            .setView(box)
+            .setPositiveButton("حفظ وجلب") { _, _ ->
+                prefs.edit().putString("cf_id", idF.text.toString().trim())
+                    .putString("cf_tok", tkF.text.toString().trim()).putLong("cf_exp", 0L).apply()
+                if (Turn.cfConfigured(prefs)) {
+                    toast("جارٍ جلب بيانات TURN...")
+                    Turn.cfRefresh(prefs) { ok, m -> toast(if (ok) "تم جلب بيانات TURN ✓ وستتجدد تلقائياً" else "فشل: $m") }
+                }
+            }
+            .setNeutralButton("صفحة الشرح") { _, _ -> openUrl("https://developers.cloudflare.com/realtime/turn/generate-credentials/") }
+            .setNegativeButton("إزالة") { _, _ ->
+                prefs.edit().remove("cf_id").remove("cf_tok").remove("cf_lines").remove("cf_exp").apply()
+                toast("أُزيل Cloudflare")
+            }
+            .showStyled()
+    }
+
+    private fun testTurn(target: EditText) {
+        if (engine != null) { toast("أنهِ المكالمة الحالية أولاً"); return }
+        if (Turn.cfConfigured(prefs) && Turn.cfCached(prefs).isEmpty()) {
+            toast("جارٍ جلب بيانات Cloudflare...")
+            Turn.cfRefresh(prefs) { ok, m -> if (ok) testTurn(target) else toast(m) }
+            return
+        }
+        val servers = Turn.build(target.text.toString(), Turn.cfCached(prefs), false)
+        if (servers.isEmpty()) { toast("أضف خادم TURN أولاً (لصق أو Cloudflare)"); return }
+        toast("جارٍ الاختبار... (حتى ١٢ ثانية)")
+        Turn.test(this, servers) { _, m ->
+            AlertDialog.Builder(this).setMessage(m).setPositiveButton("حسناً", null).showStyled()
+        }
+    }
+
+    private fun relayField(): EditText = field("https://ntfy.example.com").apply {
+        textSize = 12f; typeface = Typeface.MONOSPACE; textDirection = View.TEXT_DIRECTION_LTR
+        setText(prefs.getString("relay_url", "") ?: "")
+    }
+
+    private fun relayCard(f: EditText): LinearLayout = card("🛰 خادم الوسيط (اختياري)", f,
+        chipRow(
+            chip("📋 لصق") { val t = clipText().trim(); if (t.startsWith("https://")) f.setText(t) else toast("انسخ رابط الخادم (https://...) أولاً") },
+            chip("↩ الافتراضي") { f.setText("") }),
+        label("الخادم المجاني ntfy.sh يحدّ كل جهاز بـ ٢٥٠ رسالة يومياً. خادم ntfy خاص بك يلغي الحد ويزيد الخصوصية. اضبط نفس الرابط على الهاتفين (أو يُنقل برمز QR).", 11.5f, MUTED, false))
+
+    private fun saveRelay(f: EditText) {
+        val u = f.text.toString().trim()
+        prefs.edit().putString("relay_url", u).apply()
+        Relay.set(u)
+    }
+
+    private fun openUrl(u: String) {
+        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+        catch (_: Exception) { copy(u) }
+    }
+
+    private fun normalizeTurn(raw: String): String = Turn.normalize(raw)
 
     private fun statusBox(): TextView = label("", 13f, Color.WHITE, false).apply {
         background = rounded(Color.parseColor("#12304A"), 14, Color.parseColor("#1D4E7A"))
@@ -357,17 +477,28 @@ class MainActivity : Activity() {
             cardLp(14)
         )
         turnP = turnField()
-        cfIdP = field("Cloudflare TURN Key ID (اختياري)").apply { setText(prefs.getString("cf_id", "") ?: "") }
-        cfTokP = field("Cloudflare TURN API Token (اختياري)").apply { setText(prefs.getString("cf_tok", "") ?: "") }
         pc.addView(
-            card("خادم TURN (اختياري، موصى به)", turnPresetsRow(turnP), turnP,
-                label("يجعل الاتصال يعمل على بيانات الجوال وبين الشبكات المختلفة. ضعه على الهاتفين.", 11.5f, MUTED, false),
-                label("اضغط زر جاهز بدل الكتابة، أو اكتب خادمك الخاص. المكالمة نفسها مشفّرة بأي الحالتين.", 11f, MUTED, false),
-                label("لو المكالمة تنقطع كثيرًا: Cloudflare TURN أعلى سعة من الخوادم المجانية أعلاه.", 11f, MUTED, false),
-                cfIdP, cfTokP,
-                pill("💾 حفظ بيانات Cloudflare", false) { saveCfCreds(cfIdP, cfTokP) }),
+            card("خادم TURN (اختياري، موصى به)", turnP, turnBar(turnP),
+                label("يجعل الاتصال يعمل على بيانات الجوال وبين الشبكات المختلفة. ضعه على الهاتفين.", 11.5f, MUTED, false)),
             cardLp()
         )
+        wakeUrl = field("https://...run.app").apply {
+            textSize = 12f; typeface = Typeface.MONOSPACE; textDirection = View.TEXT_DIRECTION_LTR
+            setText(prefs.getString("wake_url", "") ?: "")
+        }
+        pc.addView(
+            card("⚡ إيقاظ فوري عبر FCM (اختياري)", wakeUrl,
+                chipRow(
+                    chip("📋 لصق") { val t = clipText().trim(); if (t.startsWith("https://")) wakeUrl.setText(t) else toast("انسخ رابط الدالة أولاً") },
+                    chip("🧪 اختبار") {
+                        Fcm.wakeRoom(wakeUrl.text.toString(), "sc-" + "0".repeat(40)) { ok, m ->
+                            runOnUiThread { toast(if (ok) "✅ الدالة تعمل ($m)" else "❌ فشل: $m") }
+                        }
+                    }),
+                label("يوقظ هاتف الطفل فوراً حتى لو أغلقه نظام الهاتف. يحتاج إعداد Firebase مرة واحدة (SETUP_FCM.md).", 11.5f, MUTED, false)),
+            cardLp())
+        relayP = relayField()
+        pc.addView(relayCard(relayP), cardLp())
         statusP = statusBox()
         pc.addView(statusP, cardLp())
         pc.addView(pill("⬅ تغيير دور الهاتف", false) { show(modeScreen) }, cardLp(18))
@@ -376,6 +507,7 @@ class MainActivity : Activity() {
         // ---------- child setup screen ----------
         val cc = screenCol()
         cc.addView(header("هاتف الطفل", "إعداد لمرة واحدة"))
+        cc.addView(pill("📷 مسح رمز QR من هاتف الأهل (الأسرع)", true) { startQrScan() }, cardLp(18))
         childName = field("اسم الطفل (كما سيظهر عند الأهل)").apply {
             setText(prefs.getString("cname", "") ?: "")
         }
@@ -396,14 +528,9 @@ class MainActivity : Activity() {
             cardLp()
         )
         turnC = turnField()
-        cfIdC = field("Cloudflare TURN Key ID (اختياري)").apply { setText(prefs.getString("cf_id", "") ?: "") }
-        cfTokC = field("Cloudflare TURN API Token (اختياري)").apply { setText(prefs.getString("cf_tok", "") ?: "") }
-        cc.addView(
-            card("٤ · خادم TURN (اختياري)", turnPresetsRow(turnC), turnC,
-                label("لو الاتصال ينقطع كثيرًا، أضف بيانات Cloudflare TURN (نفسها على الهاتفين):", 11f, MUTED, false),
-                cfIdC, cfTokC),
-            cardLp()
-        )
+        cc.addView(card("٤ · خادم TURN (اختياري)", turnC, turnBar(turnC)), cardLp())
+        relayC = relayField()
+        cc.addView(relayCard(relayC), cardLp())
         cc.addView(pill("✅ تفعيل وضع الطفل", true) { onActivateChild() }, cardLp(18))
         cc.addView(
             pill("🔋 استثناء التطبيق من توفير البطارية", false) {
@@ -411,6 +538,11 @@ class MainActivity : Activity() {
             }, cardLp(10)
         )
         cc.addView(pill("⬅ تغيير دور الهاتف", false) { show(modeScreen) }, cardLp(10))
+        if (prefs.getBoolean("cpaired", false) || (prefs.getString("ccode", "") ?: "").isNotBlank()) {
+            cc.addView(pill("إلغاء الاقتران وإيقاف استقبال المكالمات نهائياً", false) {
+                askPin { unpairChild() }
+            }, cardLp(12))
+        }
         childSetup = ScrollView(this).apply { addView(cc); isFillViewport = true }
 
         // ---------- child standby screen ----------
@@ -434,10 +566,13 @@ class MainActivity : Activity() {
         }
         childStandby.addView(standbyMsg, cardLp(16))
         childStandby.addView(
-            label("هذا الهاتف يستقبل نداء الأهل تلقائياً. اترك التطبيق مفتوحاً والهاتف موصولاً بالشاحن.", 11.5f, MUTED, false)
+            label("يستمر استقبال نداءات الأهل حتى بعد الخروج من هذه الشاشة أو استخدام تطبيق آخر. اترك الإنترنت مفعّلاً ولا تفرض إيقاف التطبيق من إعدادات النظام.", 11.5f, MUTED, false)
                 .apply { gravity = Gravity.CENTER }, cardLp(18)
         )
-        childStandby.addView(pill("⚙️ إيقاف وضع الطفل (PIN)", false) { askPin { leaveChild() } }, cardLp(26))
+        readyView = label("", 12f, MUTED, false).apply { gravity = Gravity.CENTER }
+        childStandby.addView(readyView, cardLp(10))
+        childStandby.addView(pill("🩺 فحص الجاهزية", false) { showReadiness(false) }, cardLp(10))
+        childStandby.addView(pill("⚙️ الخروج من وضع الطفل مع استمرار استقبال المكالمات (PIN)", false) { askPin { leaveChild() } }, cardLp(26))
 
         // ---------- call screen ----------
         callLayout = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
@@ -549,6 +684,7 @@ class MainActivity : Activity() {
 
         for (v in listOf<View>(modeScreen, parentScreen, childSetup, childStandby, callLayout))
             root.addView(v, FrameLayout.LayoutParams(-1, -1))
+        Fonts.apply(root, this)
         setContentView(root)
     }
 
@@ -563,10 +699,7 @@ class MainActivity : Activity() {
     private fun setMode(m: Int) {
         mode = m
         prefs.edit().putInt("mode", m).apply()
-        if (m == 1) {
-            refreshParent(); show(parentScreen); startParentWatchers()
-            if (Turn.cfNeedsRefresh(prefs)) Turn.cfRefresh(prefs) { _, _ -> }
-        } else show(childSetup)
+        if (m == 1) { refreshParent(); show(parentScreen); startParentWatchers() } else show(childSetup)
     }
 
     // ---------- parent: children list ----------
@@ -600,23 +733,48 @@ class MainActivity : Activity() {
         codes.values.forEach { k ->
             if (parentWatchers.containsKey(k.code)) return@forEach
             val r = Rendezvous(CallCrypto.roomId(k.code), { raw -> handleChildAlert(k, raw) }, { })
-            r.subscribe(System.currentTimeMillis() / 1000)
+            r.subscribe(System.currentTimeMillis() / 1000 - 60)
             parentWatchers[k.code] = r
+        }
+        if (!tickerOn) {
+            tickerOn = true; watchStartMs = System.currentTimeMillis()
+            autoPings = 0; lastAutoPing = watchStartMs
+            pingAll()
+            tickH.post(seenTick)
         }
     }
 
     private fun stopParentWatchers() {
+        tickerOn = false
+        tickH.removeCallbacks(seenTick)
         parentWatchers.values.forEach { it.stop() }
         parentWatchers.clear()
     }
 
     private fun handleChildAlert(k: Kid, raw: String) {
-        val t = Regex("SKC1:[A-Za-z0-9_-]+").find(CallCrypto.clean(raw))?.value ?: return
+        val t = Regex("SKC[12]:[A-Za-z0-9_-]+").find(CallCrypto.clean(raw))?.value ?: return
         val p = try { CallCrypto.open(k.code, "msg", null, t, 20 * 60 * 1000L) } catch (_: Exception) { return }
         val f = p.split("|")
         if (f.size < 3 || f[0] != "A" || !seen.add(t)) return
         when (f[1]) {
-            "notif_off" -> runOnUiThread { alertNotificationsDisabled(k.name) }
+            "notif_off" -> {
+                val ts = f[2].toLongOrNull() ?: 0L
+                if (System.currentTimeMillis() / 1000 - ts < 120) runOnUiThread { alertNotificationsDisabled(k.name) }
+            }
+            "alm" -> {
+                val ts = f.getOrNull(3)?.toLongOrNull() ?: 0L
+                if (System.currentTimeMillis() / 1000 - ts < 120) runOnUiThread { toast("✅ وصل المنبه إلى هاتف ${k.name}") }
+            }
+            "pong" -> {
+                val ts = f[2].toLongOrNull() ?: return
+                if (Math.abs(System.currentTimeMillis() / 1000 - ts) > 45) return   // an old answer is not proof
+                val room = CallCrypto.roomId(k.code)
+                val batt = f.getOrNull(3)?.toIntOrNull() ?: -1
+                val now = System.currentTimeMillis()
+                pongAt[k.code] = now
+                prefs.edit().putLong("seen_$room", now).putInt("batt_$room", batt).apply()
+                runOnUiThread { updateSeenLabels() }
+            }
         }
     }
 
@@ -646,6 +804,7 @@ class MainActivity : Activity() {
 
     private fun refreshParent() {
         parentList.removeAllViews()
+        seenLabels.clear()
         val kids = loadKids()
         if (kids.isEmpty()) {
             parentList.addView(label("لا يوجد أطفال بعد. أضف طفلاً من الأسفل.", 13f, MUTED, false))
@@ -663,11 +822,13 @@ class MainActivity : Activity() {
             val watchRow = row("📹 صوت وصورة" to { callKid(k, "v") }, "✉️ رسالة" to {
                 askMessage { text -> sendMailboxMsg(k, text) }
             })
+            val quietRow = row("🌙 نظرة هادئة" to { callKid(k, "q") }, "⏰ منبه" to { alarmsDialog(k) })
             val locRow = row("📍 موقعه الآن" to { requestLocation(k, false) }, "📡 تتبع مباشر" to { requestLocation(k, true) })
-            val alarmRow = row("⏰ ضبط منبه" to { askAlarmMinutes { mins, label -> sendAlarm(k, mins, label) } })
             val manageRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                addView(pill("📋 رمز الاقتران", false) { showKidCode(k) },
+                addView(pill("📋 الرمز", false) { showKidCode(k) },
+                    LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+                addView(pill("📷 QR", false) { showKidQr(k) },
                     LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
                 addView(pill("🗑 حذف", false) {
                     AlertDialog.Builder(this@MainActivity)
@@ -676,11 +837,259 @@ class MainActivity : Activity() {
                         .setPositiveButton("حذف") { _, _ ->
                             saveKids(loadKids().filter { it.code != k.code }); refreshParent()
                         }
-                        .setNegativeButton("إلغاء", null).show()
+                        .setNegativeButton("إلغاء", null).showStyled()
                 }, LinearLayout.LayoutParams(0, -2, 1f))
             }
-            parentList.addView(card("🧒 ${k.name}", callRow, watchRow, locRow, alarmRow, manageRow), cardLp(10))
+            val seen = label("", 12f, MUTED, false)
+            seenLabels[k.code] = seen
+            seen.setOnClickListener { pingKid(k); updateSeenLabels() }
+            parentList.addView(card("🧒 ${k.name}", seen, callRow, watchRow, quietRow, locRow, manageRow), cardLp(10))
         }
+        updateSeenLabels()
+    }
+
+    // ---------- alarms: set from the parent, rings on the child phone even without internet ----------
+    private fun almKey(k: Kid) = "alm_" + CallCrypto.roomId(k.code)
+
+    private fun loadAlarmList(k: Kid): MutableList<JSONObject> {
+        val out = mutableListOf<JSONObject>()
+        try {
+            val a = JSONArray(prefs.getString(almKey(k), "[]"))
+            val now = System.currentTimeMillis()
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                if (o.optBoolean("r") || o.optLong("w") > now) out.add(o)
+            }
+        } catch (_: Exception) {}
+        return out
+    }
+
+    private fun saveAlarmList(k: Kid, l: List<JSONObject>) {
+        val a = JSONArray()
+        l.forEach { a.put(it) }
+        prefs.edit().putString(almKey(k), a.toString()).apply()
+    }
+
+    private fun alarmsDialog(k: Kid) {
+        val list = loadAlarmList(k)
+        val fmt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US)
+        val items = mutableListOf("➕ منبه جديد")
+        list.forEach { o ->
+            items.add("⏰ " + fmt.format(java.util.Date(o.optLong("w"))) +
+                (if (o.optBoolean("r")) " · كل يوم" else "") +
+                (if (o.optString("l").isNotEmpty()) " · " + o.optString("l") else "") + "   (اضغط للإلغاء)")
+        }
+        AlertDialog.Builder(this).setTitle("منبهات ${k.name}")
+            .setItems(items.toTypedArray<CharSequence>()) { _, i -> if (i == 0) newAlarm(k) else cancelAlarm(k, list[i - 1]) }
+            .setNegativeButton("إغلاق", null).showStyled()
+    }
+
+    private fun newAlarm(k: Kid) {
+        val c = java.util.Calendar.getInstance()
+        android.app.TimePickerDialog(this, { _, h, m -> askAlarmOptions(k, h, m) },
+            c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE),
+            android.text.format.DateFormat.is24HourFormat(this)).show()
+    }
+
+    private fun askAlarmOptions(k: Kid, h: Int, m: Int) {
+        val lbl = field("اسم المنبه (اختياري)").apply { setText("استيقظ") }
+        val daily = CheckBox(this).apply { text = "كرّر كل يوم"; setTextColor(Color.WHITE) }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(10), dp(18), 0)
+            addView(lbl)
+            addView(daily, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(10) })
+        }
+        AlertDialog.Builder(this).setTitle("منبه %02d:%02d".format(h, m)).setView(box)
+            .setPositiveButton("إرسال") { _, _ ->
+                sendAlarm(k, h, m, daily.isChecked, lbl.text.toString().trim().replace("|", " "))
+            }
+            .setNegativeButton("إلغاء", null).showStyled()
+    }
+
+    private fun sendAlarm(k: Kid, h: Int, m: Int, rep: Boolean, label: String) {
+        val c = java.util.Calendar.getInstance()
+        c.set(java.util.Calendar.HOUR_OF_DAY, h); c.set(java.util.Calendar.MINUTE, m)
+        c.set(java.util.Calendar.SECOND, 0); c.set(java.util.Calendar.MILLISECOND, 0)
+        if (c.timeInMillis <= System.currentTimeMillis()) c.add(java.util.Calendar.DAY_OF_MONTH, 1)
+        val id = "%02d%02d".format(h, m)
+        val w = c.timeInMillis
+        val payload = "AL|$id|${System.currentTimeMillis()}|$w|${if (rep) 1 else 0}|$label"
+        Rendezvous(CallCrypto.roomId(k.code), { }, { }).publish(CallCrypto.seal(k.code, "alm", null, payload)) { ok ->
+            runOnUiThread {
+                if (ok) {
+                    val l = loadAlarmList(k).filter { it.optString("id") != id }.toMutableList()
+                    l.add(JSONObject().put("id", id).put("w", w).put("r", rep).put("l", label))
+                    saveAlarmList(k, l)
+                    toast("أُرسل المنبه ✓ يصل الهاتف عند اتصاله بالإنترنت، وبعدها يرنّ حتى بدون إنترنت")
+                    Fcm.wake(prefs.getString("wake_url", "") ?: "", k.code, true)
+                } else toast("تعذّر الإرسال، تحقق من الإنترنت")
+            }
+        }
+    }
+
+    private fun cancelAlarm(k: Kid, o: JSONObject) {
+        val id = o.optString("id")
+        Rendezvous(CallCrypto.roomId(k.code), { }, { })
+            .publish(CallCrypto.seal(k.code, "alm", null, "AC|$id|${System.currentTimeMillis()}")) { ok ->
+                runOnUiThread {
+                    if (ok) {
+                        saveAlarmList(k, loadAlarmList(k).filter { it.optString("id") != id })
+                        toast("أُرسل طلب الإلغاء")
+                    } else toast("تعذّر الإرسال، تحقق من الإنترنت")
+                }
+            }
+    }
+
+    /** Child: a parent's alarm request (kind "alm", valid 12 h so it also works if the phone was offline when sent). */
+    private fun handleAlarmMsg(t: String): Boolean {
+        val p = try { CallCrypto.open(curCode, "alm", null, t, 12 * 3600 * 1000L) } catch (_: Exception) { return false }
+        if (!seen.add(t)) return true
+        val f = p.split("|", limit = 6)
+        val id: String
+        when {
+            f[0] == "AL" && f.size >= 6 -> {
+                id = f[1]
+                Alarms.apply(this, id, f[2].toLongOrNull() ?: 0L, f[3].toLongOrNull() ?: 0L, f[4] == "1", f[5])
+            }
+            f[0] == "AC" && f.size >= 3 -> {
+                id = f[1]
+                Alarms.cancel(this, id, f[2].toLongOrNull() ?: 0L)
+            }
+            else -> return true
+        }
+        rv?.publish(CallCrypto.seal(curCode, "msg", null, "A|alm|$id|${System.currentTimeMillis() / 1000}")) { }
+        return true
+    }
+
+    private fun showKidQr(k: Kid) {
+        val payload = Qr.encode(k.name, k.code, normalizeTurn(prefs.getString("turn", "") ?: ""),
+            prefs.getString("cf_id", "") ?: "", prefs.getString("cf_tok", "") ?: "", prefs.getString("relay_url", "") ?: "")
+        val bmp = try { Qr.bitmap(payload, 720) } catch (e: Exception) { toast("الرمز كبير جداً. قلّل إعدادات TURN"); return }
+        val img = ImageView(this).apply {
+            setImageBitmap(bmp); setBackgroundColor(Color.WHITE)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(16), dp(12), dp(16), 0)
+            addView(label("امسحه من هاتف ${k.name} (وضع الطفل ← مسح QR). يحوي الرمز السري: لا تصوّره ولا ترسله.", 12f, MUTED, false))
+            addView(img, LinearLayout.LayoutParams(dp(280), dp(280)).apply { topMargin = dp(10) })
+        }
+        val d = AlertDialog.Builder(this).setTitle("QR اقتران ${k.name}").setView(box)
+            .setPositiveButton("إغلاق", null).create()
+        d.window?.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        d.show()
+        Fonts.apply(d.window?.decorView, this)
+    }
+
+    private fun startQrScan() {
+        try {
+            IntentIntegrator(this).setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
+                .setPrompt("وجّه الكاميرا نحو رمز QR المعروض في هاتف الأهل")
+                .setBeepEnabled(false).setOrientationLocked(false).initiateScan()
+        } catch (e: Exception) { toast("تعذّر فتح الماسح") }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(rc: Int, res: Int, data: Intent?) {
+        super.onActivityResult(rc, res, data)
+        val r = IntentIntegrator.parseActivityResult(rc, res, data) ?: return
+        val txt = r.contents ?: return
+        val j = Qr.decode(txt)
+        if (j == null) { toast("هذا ليس رمز اقتران SecureCall"); return }
+        childName.setText(j.optString("n")); childCode.setText(j.optString("c"))
+        if (j.has("t")) turnC.setText(j.optString("t"))
+        if (j.has("r")) relayC.setText(j.optString("r"))
+        if (j.has("ci") && j.has("ct")) {
+            prefs.edit().putString("cf_id", j.optString("ci")).putString("cf_tok", j.optString("ct")).putLong("cf_exp", 0L).apply()
+            Turn.cfRefresh(prefs) { _, _ -> }
+        }
+        toast("تم ملء البيانات ✓ أدخل رمز PIN ثم اضغط تفعيل")
+    }
+
+    // ---------- parent: is the child phone really reachable? (live ping/pong, nothing runs in the background) ----------
+    private val pingAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val pongAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private var autoPings = 0
+    private var lastAutoPing = 0L
+
+    private val seenTick = object : Runnable {
+        override fun run() {
+            updateSeenLabels()
+            val now = System.currentTimeMillis()
+            if (autoPings < 12 && now - lastAutoPing > 150000L) { lastAutoPing = now; autoPings++; pingAll() }
+            tickH.postDelayed(this, 5000)
+        }
+    }
+
+    private fun pingKid(k: Kid) {
+        pingAt[k.code] = System.currentTimeMillis()
+        Rendezvous(CallCrypto.roomId(k.code), { }, { })
+            .publish(CallCrypto.seal(k.code, "msg", null, "PG|${System.currentTimeMillis() / 1000}")) { ok ->
+                if (!ok) { pingAt[k.code] = 1L; runOnUiThread { updateSeenLabels() } }
+            }
+    }
+
+    private fun pingAll() = loadKids().forEach { pingKid(it) }
+
+    private fun updateSeenLabels() {
+        val now = System.currentTimeMillis()
+        loadKids().forEach { k ->
+            val room = CallCrypto.roomId(k.code)
+            val lbl = seenLabels[k.code] ?: return@forEach
+            val ping = pingAt[k.code] ?: 0L
+            val pong = pongAt[k.code] ?: 0L
+            val last = prefs.getLong("seen_$room", 0L)
+            val batt = prefs.getInt("batt_$room", -1)
+            val bt = if (batt >= 0) " · 🔋 $batt%" else ""
+            val lastTxt = if (last > 0) "آخر ظهور " + timeFmt.format(java.util.Date(last)) else "لم يظهر بعد"
+            val limited = if (Relay.limited()) "\n⚠️ وصلت حد رسائل ntfy المجاني (٢٥٠/يوم). انتظر أو استخدم خادماً خاصاً." else ""
+            when {
+                ping == 0L && pong == 0L -> { lbl.text = "⚪ جارٍ فحص الاتصال..."; lbl.setTextColor(MUTED) }
+                ping == 1L -> { lbl.text = "⚠️ تعذّر الفحص (لا إنترنت عندك أو حد الرسائل)$limited"; lbl.setTextColor(DANGER) }
+                pong >= ping && now - pong < 200000L -> {
+                    lbl.text = "🟢 متصل الآن · تأكّد قبل ${(now - pong) / 1000} ث$bt"; lbl.setTextColor(ACCENT)
+                }
+                pong < ping && now - ping > 20000L -> {
+                    lbl.text = "🔴 لا يردّ — $lastTxt$bt\n(اضغط هنا للفحص من جديد)$limited"; lbl.setTextColor(DANGER)
+                }
+                pong < ping -> { lbl.text = "⏳ جارٍ الفحص..."; lbl.setTextColor(MUTED) }
+                else -> { lbl.text = "⚪ آخر تأكّد قبل ${(now - pong) / 60000} د — اضغط هنا للتحديث"; lbl.setTextColor(MUTED) }
+            }
+            if (ping > 1L && pong < ping && now - ping > 20000L && now - watchStartMs > 25000L) {
+                if (offlineAlerted.add(k.code))
+                    postAlert("off_" + k.name, "هاتف ${k.name} لا يردّ",
+                        "لم يردّ على فحص الاتصال. قد لا تصل المكالمة حتى يعود للاتصال بالإنترنت أو يُفتح وضع الطفل.")
+            } else if (pong >= ping && pong > 0L) offlineAlerted.remove(k.code)
+        }
+    }
+
+    private fun postAlert(key: String, title: String, text: String) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            if (android.os.Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(
+                android.app.NotificationChannel("securecall_alert", "تنبيهات SecureCall", android.app.NotificationManager.IMPORTANCE_HIGH))
+            val open = android.app.PendingIntent.getActivity(
+                this, 3, Intent(this, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val b = if (android.os.Build.VERSION.SDK_INT >= 26) android.app.Notification.Builder(this, "securecall_alert")
+            else android.app.Notification.Builder(this).setPriority(android.app.Notification.PRIORITY_HIGH)
+            b.setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentTitle(title).setContentText(text)
+                .setStyle(android.app.Notification.BigTextStyle().bigText(text))
+                .setContentIntent(open).setAutoCancel(true)
+            nm.notify(key.hashCode(), b.build())
+        } catch (_: Exception) {}
+    }
+
+    private fun batteryPct(): Int {
+        val i = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return -1
+        val l = i.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+        val sc = i.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1)
+        return if (l < 0 || sc <= 0) -1 else l * 100 / sc
     }
 
     private fun addKid() {
@@ -703,7 +1112,7 @@ class MainActivity : Activity() {
                     type = "text/plain"; putExtra(Intent.EXTRA_TEXT, k.code)
                 }, "مشاركة"))
             }
-            .setNegativeButton("إغلاق", null).show()
+            .setNegativeButton("إغلاق", null).showStyled()
     }
 
     // ---------- permissions / service ----------
@@ -762,11 +1171,6 @@ class MainActivity : Activity() {
         try { stopService(Intent(this, CallService::class.java)) } catch (_: Exception) {}
     }
 
-    /** STUN + manual TURN (incl. the quick presets) + Cloudflare's auto-renewing credentials when
-     *  configured (see TurnTools.kt) — Cloudflare's relay has a far higher usage quota than the free
-     *  Open Relay demo credentials, which is the most common reason a call cuts out or won't connect
-     *  on strict networks ("limited call" in practice is usually a limited free relay, not a limit
-     *  we set in the app). */
     private fun iceServers(): List<PeerConnection.IceServer> = Turn.iceServers(prefs)
 
     /** PIN hashing: PBKDF2-HMAC-SHA256, 120,000 rounds, random 16-byte salt per install — far
@@ -826,7 +1230,7 @@ class MainActivity : Activity() {
                     toast("رمز PIN غير صحيح")
                 }
             }
-            .setNegativeButton("إلغاء", null).show()
+            .setNegativeButton("إلغاء", null).showStyled()
     }
 
     private fun dim(on: Boolean) {
@@ -844,10 +1248,14 @@ class MainActivity : Activity() {
         if (!CallCrypto.isStrong(code)) { toast("رمز الاقتران غير صالح. انسخه من هاتف الأهل كما هو."); return }
         val hasPin = (prefs.getString("pinh", "") ?: "").isNotEmpty()
         if (pin.length < 4 && !(hasPin && pin.isEmpty())) { toast("رمز PIN يجب أن يكون 4 أرقام على الأقل"); return }
+        val previousCode = prefs.getString("ccode", "") ?: ""
+        if (previousCode.isNotBlank() && previousCode != code) Fcm.unsubscribe(this, previousCode)
         prefs.edit()
             .putString("cname", name).putString("ccode", code)
-            .putString("turn", turnC.text.toString()).putBoolean("cactive", true)
+            .putString("turn", turnC.text.toString())
+            .putBoolean("cpaired", true).putBoolean("cactive", true)
             .apply()
+        saveRelay(relayC)
         if (pin.isNotEmpty()) setPin(pin)
         ensurePerms(
             listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
@@ -880,7 +1288,7 @@ class MainActivity : Activity() {
                 if (needsAutostart) ui.postDelayed({ openAutoStartSettings() }, if (needsBattery) 1200 else 0)
             }
             .setNegativeButton("لاحقًا", null)
-            .show()
+            .showStyled()
     }
 
     private fun requestBatteryExemption() {
@@ -926,20 +1334,142 @@ class MainActivity : Activity() {
         toast("دوّر على \"بدء تلقائي\" أو \"تشغيل بالخلفية\" في إعدادات هذا التطبيق")
     }
 
-    private fun activateChild() {
+    // ---------- child readiness: everything a call needs while the app is closed ----------
+    private class Gap(val text: String, val fix: () -> Unit)
+
+    private fun readinessGaps(): List<Gap> {
+        val g = mutableListOf<Gap>()
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (!nm.areNotificationsEnabled()) g.add(Gap("الإشعارات مغلقة. على بعض الهواتف (شاومي خصوصاً) يوقف النظام التطبيق معها فلا تصل المكالمات.") {
+            try {
+                startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+            } catch (_: Exception) {}
+        })
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) g.add(Gap("استثناء توفير البطارية غير مفعّل.") { requestBatteryExemption() })
+        if (!Settings.canDrawOverlays(this)) g.add(Gap("«العرض فوق التطبيقات» غير مفعّل. هو الذي يسمح للتطبيق بالفتح عند النداء وهو مغلق.") {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            } catch (_: Exception) {}
+        })
+        if (android.os.Build.VERSION.SDK_INT >= 34 && !nm.canUseFullScreenIntent()) g.add(Gap("إشعارات ملء الشاشة غير مفعّلة.") {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+            } catch (_: Exception) {}
+        })
+        if (android.os.Build.VERSION.SDK_INT >= 29 &&
+            checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED
+        ) g.add(Gap("الموقع «طوال الوقت» غير مفعّل. بدونه لا يُرسل الموقع والتطبيق مغلق.") {
+            try { requestPermissions(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 3) } catch (_: Exception) {}
+        })
+        return g
+    }
+
+    private fun updateReadyLabel() {
+        if (!this::readyView.isInitialized) return
+        val n = readinessGaps().size
+        readyView.text = if (n == 0) "✅ الهاتف جاهز لاستقبال النداء" else "⚠️ $n إعدادات ناقصة قد تمنع وصول المكالمة — اضغط «فحص الجاهزية»"
+        readyView.setTextColor(if (n == 0) ACCENT else DANGER)
+    }
+
+    private fun showReadiness(auto: Boolean) {
+        if (mode != 2) return
+        val gaps = readinessGaps()
+        updateReadyLabel()
+        if (gaps.isEmpty()) { if (!auto) toast("✅ كل شيء جاهز لاستقبال نداء الأهل"); return }
+        val auto2 = autoStartIntent() != null
+        val msg = gaps.joinToString("\n\n") { "⚠️ " + it.text } +
+            (if (auto2) "\n\nوفي هذا الهاتف فعّل أيضاً «التشغيل التلقائي» وثبّت التطبيق في الخلفية." else "")
+        val b = AlertDialog.Builder(this).setTitle("جاهزية استقبال المكالمات").setMessage(msg)
+            .setPositiveButton("إصلاح التالي") { _, _ -> gaps[0].fix() }
+            .setNegativeButton("لاحقاً", null)
+        if (auto2) b.setNeutralButton("التشغيل التلقائي") { _, _ -> openAutoStartSettings() }
+        b.showStyled()
+    }
+
+    /** Android 14+: a call-style full-screen notification needs the user's OK in a system screen. */
+    private fun maybeAskFullScreen() {
+        if (android.os.Build.VERSION.SDK_INT < 34 || !Fcm.available(this)) return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        if (nm.canUseFullScreenIntent() || prefs.getBoolean("askedFsi", false)) return
+        prefs.edit().putBoolean("askedFsi", true).apply()
+        AlertDialog.Builder(this)
+            .setTitle("السماح بفتح التطبيق عند نداء الأهل")
+            .setMessage("حتى يظهر التطبيق على الشاشة فور النداء، فعّل «إشعارات ملء الشاشة» لهذا التطبيق في الشاشة التالية.")
+            .setPositiveButton("فتح الإعداد") { _, _ ->
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+                } catch (_: Exception) {}
+            }
+            .setNegativeButton("لاحقاً", null).showStyled()
+    }
+
+    private fun handleWakeIntent(i: Intent?) {
+        val ii = i ?: return
+        val alarm = ii.getStringExtra("alarm")
+        val quiet = ii.getBooleanExtra("quiet", false)
+        if (!ii.getBooleanExtra("wake", false) && alarm == null) return
+        if (quiet && alarm == null) dim(true)          // quiet look: don't light the screen up
+        else if (android.os.Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
+        else window.addFlags(
+            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD)
+        ii.removeExtra("wake"); ii.removeExtra("quiet"); ii.removeExtra("alarm")
+        if (alarm != null) showAlarmDialog(alarm)
+    }
+
+    private var alarmDlg: AlertDialog? = null
+
+    private fun showAlarmDialog(label: String) {
+        try { alarmDlg?.dismiss() } catch (_: Exception) {}
+        alarmDlg = AlertDialog.Builder(this).setTitle("⏰ منبه من الأهل").setMessage(label)
+            .setCancelable(false)
+            .setPositiveButton("إيقاف") { _, _ -> Alarms.stopRinging(this) }
+            .showStyled()
+    }
+
+    private fun AlertDialog.Builder.showStyled(): AlertDialog {
+        val d = show()
+        Fonts.apply(d.window?.decorView, this@MainActivity)
+        return d
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val paired = prefs.getBoolean("cpaired", false) || (prefs.getString("ccode", "") ?: "").isNotBlank()
+        if (intent?.getBooleanExtra("wake", false) == true && paired && !prefs.getBoolean("cactive", false)) {
+            if (hasPerms(listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))) {
+                activateChild(backgroundWake = true)
+            } else {
+                ensurePerms(listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)) {
+                    activateChild(backgroundWake = true)
+                }
+            }
+        }
+        handleWakeIntent(intent)
+    }
+
+    private fun activateChild(backgroundWake: Boolean = false) {
         mode = 2
         curName = prefs.getString("cname", "") ?: ""
         curCode = prefs.getString("ccode", "") ?: ""
-        TokenRegistrar.register(applicationContext)
-        if (Turn.cfNeedsRefresh(prefs)) Turn.cfRefresh(prefs) { _, _ -> }
-        maybeAskBackgroundReliability()
-        requestUninstallProtection()
+        prefs.edit().putBoolean("cpaired", true).apply()
+        Fcm.subscribe(this, curCode)
+        Alarms.scheduleAll(this)
+        ChildListenService.start(this)
+        tickH.postDelayed({ showReadiness(true) }, 800)
+        if (!backgroundWake) {
+            requestUninstallProtection()
+            tickH.postDelayed({ maybeAskBackgroundReliability() }, 1500)
+        }
         dim(true)
         standbyTitle.text = "هاتف $curName"
         show(childStandby)
         startStandby()
     }
 
+    /** Exit the child-mode interface only. Pairing and the background receiver remain active. */
     private fun leaveChild() {
         stopLive()
         try {
@@ -947,12 +1477,32 @@ class MainActivity : Activity() {
             val admin = android.content.ComponentName(this, ChildDeviceAdmin::class.java)
             if (dpm.isAdminActive(admin)) dpm.removeActiveAdmin(admin)
         } catch (_: Exception) {}
-        prefs.edit().putBoolean("cactive", false).apply()
+        prefs.edit().putBoolean("cactive", false).putInt("mode", 0).apply()
+        mode = 0
         resetCall()
         inSession = false
         stopCallService()
         dim(false)
-        show(childSetup)
+        show(modeScreen)
+        toast("تم الخروج من وضع الطفل. استقبال مكالمات الأهل ما زال يعمل في الخلفية. لإيقافه نهائياً اختر إلغاء الاقتران.")
+    }
+
+    /** Explicitly remove the pairing; unlike leaving child mode, this stops background reception. */
+    private fun unpairChild() {
+        stopLive()
+        val oldCode = prefs.getString("ccode", "") ?: ""
+        Fcm.unsubscribe(this, oldCode)
+        ChildListenService.stop(this)
+        prefs.edit()
+            .putBoolean("cpaired", false).putBoolean("cactive", false)
+            .remove("ccode").remove("cname").putInt("mode", 0).apply()
+        mode = 0
+        resetCall()
+        inSession = false
+        stopCallService()
+        dim(false)
+        show(modeScreen)
+        toast("تم إلغاء الاقتران وإيقاف استقبال المكالمات.")
     }
 
     /** Child: listen quietly to the mailbox; a valid hello from the parent starts an automatic answer. */
@@ -962,7 +1512,7 @@ class MainActivity : Activity() {
         myId = newId()
         val r = newMailbox(curCode)
         rv = r
-        r.subscribe(System.currentTimeMillis() / 1000)
+        r.subscribe(System.currentTimeMillis() / 1000 - 6 * 3600)   // also picks up alarms sent while offline
         status("")
     }
 
@@ -991,13 +1541,21 @@ class MainActivity : Activity() {
 
     // ---------- parent: start a call ----------
     private fun callKid(k: Kid, type: String) {
-        curName = k.name; curCode = k.code; callType = type; wantVideo = type == "v"
-        prefs.edit().putString("turn", turnP.text.toString()).apply()
+        curName = k.name; curCode = k.code; callType = type; wantVideo = type == "v" || type == "q"
+        prefs.edit().putString("turn", turnP.text.toString()).putString("wake_url", wakeUrl.text.toString().trim()).apply()
+        saveRelay(relayP)
         stopLocWatch(false)
-        ensurePerms(listOf(Manifest.permission.RECORD_AUDIO)) {
-            startCallService(false)
-            startParentCall()
+        val go = {
+            ensurePerms(listOf(Manifest.permission.RECORD_AUDIO)) {
+                startCallService(false)
+                startParentCall()
+                Fcm.wake(prefs.getString("wake_url", "") ?: "", k.code, type == "q")   // wake-up bell, in parallel with the normal request
+            }
         }
+        if (Turn.cfConfigured(prefs) && Turn.cfCached(prefs).isEmpty()) {
+            toast("جارٍ تجديد بيانات TURN...")
+            Turn.cfRefresh(prefs) { _, _ -> go() }
+        } else go()
     }
 
     private fun parentHello() = "P|$myId|parent|$callType"
@@ -1016,8 +1574,8 @@ class MainActivity : Activity() {
         rv = r
         r.subscribe(System.currentTimeMillis() / 1000 - 5)
         sendHello(parentHello())
-        if (!retry) WakePusher.send(curCode)
-        ui.postDelayed(helloTick, 15000)
+        helloN = 0
+        ui.postDelayed(helloTick, 3000)
         status("جارٍ الاتصال بهاتف $curName ...")
     }
 
@@ -1040,10 +1598,17 @@ class MainActivity : Activity() {
                 endCallUi("لم يردّ هاتف $curName. تأكد أنه متصل بالإنترنت وأن التطبيق يعمل بوضع الطفل.")
                 return
             }
+            if (Relay.limited()) {
+                endCallUi("وصلت حد رسائل خدمة ntfy المجانية (٢٥٠ يومياً). انتظر قليلاً أو اضبط خادم وسيط خاصاً من بطاقة «خادم الوسيط».")
+                return
+            }
             sendHello(parentHello())
-            ui.postDelayed(this, 15000)
+            ui.postDelayed(this, helloDelays.getOrElse(helloN++) { 15000L })
         }
     }
+    private var helloN = 0
+    /** Early retries are quick (the child may still be waking up), later ones are spaced out. */
+    private val helloDelays = longArrayOf(3000, 5000, 7000, 10000, 10000, 15000)
 
     /** Child phone only: every 20 s, checks whether the child has turned the app's notifications
      *  off from system Settings (their right — this never re-enables them or blocks that choice)
@@ -1062,14 +1627,18 @@ class MainActivity : Activity() {
                 }
                 notifWasEnabled = enabled
             }
-            ui.postDelayed(this, 20000)
+            if (Turn.cfNeedsRefresh(prefs) && !cfBusy && System.currentTimeMillis() - lastCfTry > 10 * 60 * 1000L) {
+                cfBusy = true; lastCfTry = System.currentTimeMillis()
+                Turn.cfRefresh(prefs) { _, _ -> cfBusy = false }
+            }
+            tickH.postDelayed(this, 20000)
         }
     }
 
     private val pairTimeout = Runnable {
         if (callLayout.visibility == View.VISIBLE) return@Runnable
         if (mode == 2) { stopCallService(); status(""); startStandby(); return@Runnable }
-        if (attempts >= 6) {
+        if (attempts >= 2) {
             endCallUi("تعذّر الاتصال بعد عدة محاولات. جرّب الواي فاي أو أضف خادم TURN على الهاتفين.")
         } else {
             attempts++
@@ -1102,6 +1671,16 @@ class MainActivity : Activity() {
         return e
     }
 
+    /** Sends a setup code; retries twice (2.5 s apart) before giving up, so one lost request doesn't kill the call. */
+    private fun publishRetry(blob: String, tries: Int = 3, fail: () -> Unit) {
+        val r = rv ?: return
+        r.publish(blob) { ok ->
+            if (ok) return@publish
+            if (tries > 1) ui.postDelayed({ publishRetry(blob, tries - 1, fail) }, 2500)
+            else runOnUiThread { fail() }
+        }
+    }
+
     private fun becomeCaller() {
         status("وجدت هاتف $curName، جارٍ تجهيز المكالمة...")
         val keep = rv
@@ -1117,9 +1696,7 @@ class MainActivity : Activity() {
             if (blob.length > 4000) {
                 status("رمز الإعداد أطول من الحد المسموح. أضف خادم TURN وجرّب مرة أخرى.")
             } else {
-                rv?.publish(blob) { ok ->
-                    runOnUiThread { if (!ok) status("تعذّر الإرسال عبر الإنترنت. تحقق من الاتصال.") }
-                }
+                publishRetry(blob) { status("تعذّر الإرسال عبر الإنترنت. تحقق من الاتصال.") }
             }
         }, { m -> status("خطأ: $m") })
     }
@@ -1128,7 +1705,7 @@ class MainActivity : Activity() {
         val bind = CallCrypto.digest(t)
         val keep = rv
         rv = null
-        val e = beginEngine(2, wantVideo, false, callType == "l")
+        val e = beginEngine(2, wantVideo, false, callType == "l" || callType == "q")
         rv = keep
         if (e == null) return
         auto = true
@@ -1140,34 +1717,16 @@ class MainActivity : Activity() {
             if (blob.length > 4000) {
                 status("الرد أطول من الحد المسموح. أضف خادم TURN على الهاتفين.")
             } else {
-                rv?.publish(blob) { ok ->
-                    runOnUiThread { if (!ok) status("تعذّر إرسال الرد. تحقق من الاتصال بالإنترنت.") }
-                }
+                publishRetry(blob) { status("تعذّر إرسال الرد. تحقق من الاتصال بالإنترنت.") }
             }
         }, { m -> status("خطأ: $m") })
     }
 
-    /** Starts answering an incoming parent call request: f[1] = parentId, f[3] = call type (v/a/l).
-     *  Called both from the normal mailbox listener (onRemote) and from a cold start triggered by
-     *  the FCM wake signal (see ChildFcmService / CallWake) when the standby long-poll alone wasn't
-     *  running in time. Either way, the encrypted request behind it came only from the mailbox. */
-    private fun beginIncomingCall(parentIdF: String, typeF: String) {
-        if (mode != 2) return
-        inSession = true
-        waitingOffer = true
-        parentId = parentIdF
-        callType = typeF
-        wantVideo = callType == "v"
-        startCallService(true)   // notification appears only now, for the real call
-        sendHello("C|$myId|$curName|$parentId")
-        ui.postDelayed(pairTimeout, 45000)
-        status("الأهل يتصلون...")
-    }
-
     /** A message arrived from the mailbox. Anything that does not decrypt with the pairing code is ignored. */
     private fun onRemote(msg: String) {
-        val t = Regex("SKC1:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
-        if (mode == 2 && handleLocReq(t)) return
+        val t = Regex("SKC[12]:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
+        if (mode == 2 && !ChildListenService.running && handleLocReq(t)) return
+        if (mode == 2 && !ChildListenService.running && handleAlarmMsg(t)) return
         if (callLayout.visibility == View.VISIBLE) return
         val code = curCode
 
@@ -1200,19 +1759,7 @@ class MainActivity : Activity() {
             if (!inSession) {
                 // standby: wait for a call request from the parent: P|parentId|label|v/a
                 val p = try { CallCrypto.open(code, "hello", null, t, 90 * 1000L) } catch (_: Exception) {
-                    // not a call request: maybe an alarm request (visible/audible — see Alarm.kt)
-                    val am = try { CallCrypto.open(code, "alm", null, t, 12 * 3600 * 1000L) } catch (_: Exception) { null }
-                    if (am != null) {
-                        if (!seen.add(t)) return
-                        val af = am.split("|", limit = 6)
-                        when {
-                            af[0] == "AL" && af.size >= 6 ->
-                                Alarms.apply(this, af[1], af[2].toLongOrNull() ?: 0L, af[3].toLongOrNull() ?: 0L, af[4] == "1", af[5])
-                            af[0] == "AC" && af.size >= 3 -> Alarms.cancel(this, af[1], af[2].toLongOrNull() ?: 0L)
-                        }
-                        return
-                    }
-                    // not that either: maybe a text message from the parent
+                    // not a call request: maybe a text message from the parent
                     val tm = try { CallCrypto.open(code, "msg", null, t, 90 * 1000L) } catch (_: Exception) { return }
                     val mf = tm.split("|", limit = 2)
                     if (mf.size == 2 && mf[0] == "M" && seen.add(t)) showParentMessage(mf[1])
@@ -1221,11 +1768,26 @@ class MainActivity : Activity() {
                 val f = p.split("|")
                 if (f.size < 4 || f[0] != "P") return
                 if (!seen.add(t)) return
-                beginIncomingCall(f[1], f[3])
+                inSession = true
+                waitingOffer = true
+                parentId = f[1]
+                callType = f[3]
+                wantVideo = callType == "v" || callType == "q"
+                startCallService(true)   // notification appears only now, for the real call
+                sendHello("C|$myId|$curName|$parentId")
+                ui.postDelayed(pairTimeout, 45000)
+                status("الأهل يتصلون...")
                 return
             }
             if (waitingOffer) {
                 if (t == lastHandled) return
+                // the parent repeats its request when our answer was lost: answer again instead of ignoring it
+                val hp = try { CallCrypto.open(code, "hello", null, t, 90 * 1000L) } catch (_: Exception) { null }
+                if (hp != null) {
+                    val hf = hp.split("|")
+                    if (hf.size >= 4 && hf[0] == "P" && hf[1] == parentId && seen.add(t)) sendHello("C|$myId|$curName|$parentId")
+                    return
+                }
                 val sdp = try { CallCrypto.open(code, "offer", null, t, 3 * 60 * 1000L) } catch (_: Exception) { return }
                 waitingOffer = false
                 answerOffer(t, sdp)
@@ -1238,12 +1800,12 @@ class MainActivity : Activity() {
         ui.removeCallbacksAndMessages(null)
         if (mode == 1) { rv?.stop(); rv = null }
         show(callLayout)
-        dim(false)
+        dim(mode == 2 && callType == "q")   // quiet look: the child's screen stays dark
         loudCount = 0
         msgView.visibility = View.GONE
         if (mode == 1) {
             bar.visibility = View.VISIBLE
-            baseTitle = if (callType == "l") "👂 استماع لهاتف $peerName" else "📱 هاتف $peerName"
+            baseTitle = when (callType) { "l" -> "👂 استماع لهاتف $peerName"; "q" -> "🌙 نظرة هادئة على $peerName"; else -> "📱 هاتف $peerName" }
             titleView.text = baseTitle
             camBanner.visibility = View.GONE
             localView.visibility = View.GONE
@@ -1257,16 +1819,19 @@ class MainActivity : Activity() {
             remoteVideoOn = wantVideo
             remoteBack = false
             vidBtn.text = if (wantVideo) "🎥" else "🚫"
+            if (callType == "q") ui.postDelayed({ if (callType == "q" && callLayout.visibility == View.VISIBLE) hangup() }, 30000)
         } else {
             bar.visibility = View.GONE
-            baseTitle = if (callType == "l") "👂 الأهل يستمعون إليك" else "👨‍👩‍👧 الأهل على الخط"
+            baseTitle = when (callType) { "l" -> "👂 الأهل يستمعون إليك"; "q" -> "🌙 الأهل يلقون نظرة عليك"; else -> "👨‍👩‍👧 الأهل على الخط" }
             titleView.text = baseTitle
             camBanner.visibility = if (wantVideo) View.VISIBLE else View.GONE
             localView.visibility = if (wantVideo) View.VISIBLE else View.GONE
             diagView.visibility = View.GONE
             levelView.visibility = View.GONE
-            buzz(400)
-            notifyChild(baseTitle, if (wantVideo) "الكاميرا تعمل الآن" else "الميكروفون يعمل")
+            if (callType != "q") {   // quiet look: no sound/vibration; the banner + notification stay visible
+                buzz(400)
+                notifyChild(baseTitle, if (wantVideo) "الكاميرا تعمل الآن" else "الميكروفون يعمل")
+            }
         }
     }
 
@@ -1323,7 +1888,7 @@ class MainActivity : Activity() {
         r.publish(CallCrypto.seal(k.code, "lreq", null, "Q|$locReqId|" + (if (live) "live" else "once")), ok)
         locView.text = "📍 جارٍ طلب موقع ${k.name}... (يصل إن كان هاتفه متصلاً بالإنترنت)"
         locCard.visibility = View.VISIBLE
-        bg.postDelayed({ stopLocWatch(false); if (lastLat == 0.0 && lastLon == 0.0) locView.text = "لم يصل موقع ${k.name}. تأكد أن هاتفه متصل بالإنترنت وفي وضع الطفل." },
+        bg.postDelayed({ stopLocWatch(false); if (lastLat == 0.0 && lastLon == 0.0) locView.text = "لم يصل موقع ${k.name}. " + (if (Relay.limited()) "وصلت حد رسائل ntfy المجاني (٢٥٠/يوم)." else "تأكد أن هاتفه متصل بالإنترنت وأن وضع الطفل مفعّل (واضغط «فحص الجاهزية» عنده).") },
             if (live) 11 * 60 * 1000L else 60 * 1000L)
     }
 
@@ -1339,7 +1904,7 @@ class MainActivity : Activity() {
     }
 
     private fun onLocMsg(msg: String) {
-        val t = Regex("SKC1:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
+        val t = Regex("SKC[12]:[A-Za-z0-9_-]+").find(CallCrypto.clean(msg))?.value ?: return
         val k = locKid ?: return
         val p = try { CallCrypto.open(k.code, "lres", null, t, 5 * 60 * 1000L) } catch (_: Exception) { return }
         if (!seen.add(t)) return
@@ -1483,37 +2048,9 @@ class MainActivity : Activity() {
                         val t = et.text.toString().trim().replace("|", " ").take(200)
                         if (t.isNotEmpty()) onSend(t)
                     }
-                    .setNegativeButton("إلغاء", null).show()
+                    .setNegativeButton("إلغاء", null).showStyled()
             }
-        }.show()
-    }
-
-    /** A real, audible, full-screen alarm clock (Android's AlarmManager) that rings on the child's
-     *  phone — same as any alarm app, nothing silent about it; see Alarm.kt for the ringing side. */
-    private fun askAlarmMinutes(onSet: (minutes: Int, label: String) -> Unit) {
-        val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val mins = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER; hint = "بعد كم دقيقة؟ (مثلاً 30)" }
-        val label = EditText(this).apply { hint = "تسمية المنبه (اختياري)، مثلاً: وقت الواجب" }
-        row.addView(mins); row.addView(label)
-        AlertDialog.Builder(this)
-            .setTitle("ضبط منبه على هاتف الطفل")
-            .setView(row)
-            .setPositiveButton("ضبط") { _, _ ->
-                val m = mins.text.toString().trim().toIntOrNull()
-                if (m == null || m <= 0) toast("اكتب عدد دقائق صحيح") else onSet(m, label.text.toString().trim())
-            }
-            .setNegativeButton("إلغاء", null).show()
-    }
-
-    private fun sendAlarm(k: Kid, minutes: Int, label: String) {
-        val id = newId()
-        val whenMs = System.currentTimeMillis() + minutes * 60_000L
-        val seq = System.currentTimeMillis()
-        val r = Rendezvous(CallCrypto.roomId(k.code), { }, { })
-        val payload = "AL|$id|$seq|$whenMs|0|${label.ifBlank { "منبه من الأهل" }}"
-        r.publish(CallCrypto.seal(k.code, "alm", null, payload)) { ok ->
-            runOnUiThread { toast(if (ok) "سيُضبط المنبه إن كان هاتف ${k.name} متصلاً بالإنترنت" else "تعذّر الإرسال، تحقق من الإنترنت") }
-        }
+        }.showStyled()
     }
 
     /** Parent, no call running: the message goes through the encrypted mailbox to the waiting child phone. */
@@ -1617,6 +2154,9 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         if (!svcOn) engine?.pauseCamera()
+        if (this::wakeUrl.isInitialized) prefs.edit().putString("wake_url", wakeUrl.text.toString().trim()).apply()
+        if (this::relayP.isInitialized) saveRelay(relayP)
+        childVisible = false
         stopParentWatchers()
         super.onPause()
     }
@@ -1624,6 +2164,7 @@ class MainActivity : Activity() {
         super.onResume()
         engine?.resumeCamera()
         if (mode == 1) startParentWatchers()
+        if (mode == 2) { childVisible = true; updateReadyLabel() }
     }
 
     @Deprecated("Deprecated in Java")
@@ -1640,6 +2181,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         stopCallService()
         ui.removeCallbacksAndMessages(null)
+        tickH.removeCallbacksAndMessages(null)
         stopParentWatchers()
         rv?.stop(); rv = null
         engine?.close(); engine = null

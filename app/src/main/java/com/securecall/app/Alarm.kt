@@ -30,7 +30,7 @@ object Alarms {
     private fun load(ctx: Context): MutableList<JSONObject> {
         val out = mutableListOf<JSONObject>()
         try {
-            val a = JSONArray(SecurePrefs.get(ctx).getString("alarms", "[]"))
+            val a = JSONArray(Store.prefs(ctx).getString("alarms", "[]"))
             for (i in 0 until a.length()) out.add(a.getJSONObject(i))
         } catch (_: Exception) {}
         return out
@@ -39,7 +39,7 @@ object Alarms {
     private fun save(ctx: Context, l: List<JSONObject>) {
         val a = JSONArray()
         l.forEach { a.put(it) }
-        SecurePrefs.get(ctx).edit().putString("alarms", a.toString()).apply()
+        Store.prefs(ctx).edit().putString("alarms", a.toString()).apply()
     }
 
     private fun opPi(ctx: Context, id: String): PendingIntent = PendingIntent.getBroadcast(
@@ -63,7 +63,7 @@ object Alarms {
 
     /** Returns true if the request was new (older/duplicate requests are ignored). */
     fun apply(ctx: Context, id: String, seq: Long, whenMs: Long, repeat: Boolean, label: String): Boolean {
-        val p = SecurePrefs.get(ctx)
+        val p = Store.prefs(ctx)
         if (seq <= p.getLong("alm_seq_$id", 0L)) return false
         p.edit().putLong("alm_seq_$id", seq).apply()
         var w = whenMs
@@ -80,7 +80,7 @@ object Alarms {
     }
 
     fun cancel(ctx: Context, id: String, seq: Long): Boolean {
-        val p = SecurePrefs.get(ctx)
+        val p = Store.prefs(ctx)
         if (seq <= p.getLong("alm_seq_$id", 0L)) return false
         p.edit().putLong("alm_seq_$id", seq).apply()
         val l = load(ctx)
@@ -187,5 +187,15 @@ class AlarmStopReceiver : BroadcastReceiver() {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         Alarms.scheduleAll(context.applicationContext)
+        // child mode survives a reboot: start the always-on listener again (no camera/mic involved here)
+        try {
+            val p = Store.prefs(context.applicationContext)
+            val code = p.getString("ccode", "") ?: ""
+            if (p.getBoolean("cpaired", false) || code.isNotBlank()) {
+                if (!p.getBoolean("cpaired", false)) p.edit().putBoolean("cpaired", true).apply()
+                ChildListenService.start(context.applicationContext)
+                Fcm.subscribe(context.applicationContext, code)
+            }
+        } catch (_: Throwable) {}
     }
 }

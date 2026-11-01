@@ -68,7 +68,13 @@ class ChildFcmService : FirebaseMessagingService() {
         ChildWake.onWake(applicationContext, message.data["q"] == "1")
     }
     override fun onNewToken(token: String) {
-        // topic subscriptions survive token refresh; nothing to store (no token is ever sent anywhere)
+        // Reassert the private room subscription after token refresh. The token itself is never shared.
+        val p = Store.prefs(applicationContext)
+        val code = p.getString("ccode", "") ?: ""
+        if (code.isNotBlank()) {
+            p.edit().putBoolean("cpaired", true).apply()
+            Fcm.subscribe(applicationContext, code)
+        }
     }
 }
 
@@ -80,7 +86,12 @@ object ChildWake {
      *  parent's repeated, encrypted call request on its own. */
     fun onWake(ctx: Context, quiet: Boolean = false) {
         val p = Store.prefs(ctx)
-        if (!p.getBoolean("cactive", false)) return
+        val code = p.getString("ccode", "") ?: ""
+        val paired = p.getBoolean("cpaired", false) || code.isNotBlank()
+        if (!paired || code.isBlank()) return
+        // Migrate existing V17 pairings without requiring the parent to pair again.
+        if (!p.getBoolean("cpaired", false)) p.edit().putBoolean("cpaired", true).apply()
+        ChildListenService.start(ctx)
         try {
             val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
             pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "securecall:wake").acquire(30 * 1000L)
@@ -102,7 +113,7 @@ object ChildWake {
             else Notification.Builder(ctx).setPriority(Notification.PRIORITY_HIGH)
             b.setSmallIcon(android.R.drawable.stat_sys_phone_call)
                 .setContentTitle("SecureCall")
-                .setContentText("نداء من الأهل — جارٍ الفتح")
+                .setContentText("نداء من الأهل — جارٍ فتح الاتصال")
                 .setCategory(Notification.CATEGORY_CALL)
                 .setContentIntent(pi)
                 .setAutoCancel(true)

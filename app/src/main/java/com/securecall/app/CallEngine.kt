@@ -37,6 +37,8 @@ class CallEngine(
     private var helper: SurfaceTextureHelper? = null
     private var remoteTrack: VideoTrack? = null
     private var gatherCb: ((String) -> Unit)? = null
+    private var graceScheduled = false
+    private var relayMode = false
     private var connectedFired = false
     private var closed = false
     private var controller = false
@@ -83,6 +85,7 @@ class CallEngine(
             // travel through the chat app, and it also hides both phones' IP addresses.
             if (iceServers.any { sv -> sv.urls.any { u -> u.startsWith("turn") } })
                 iceTransportsType = PeerConnection.IceTransportsType.RELAY
+            relayMode = iceServers.any { sv -> sv.urls.any { u -> u.startsWith("turn") } }
         }
         val p = f.createPeerConnection(cfg, observer)!!
         pc = p
@@ -244,7 +247,15 @@ class CallEngine(
         override fun onIceGatheringChange(s: PeerConnection.IceGatheringState?) {
             if (s == PeerConnection.IceGatheringState.COMPLETE) main.post { finishGather() }
         }
-        override fun onIceCandidate(c: IceCandidate?) {}
+        override fun onIceCandidate(c: IceCandidate?) {
+            // Non-trickle signalling waits for gathering. A dead TURN/STUN url can keep it open for many
+            // seconds, so as soon as a usable candidate exists, give the others 1.5 s and go.
+            if (c == null) return
+            val usable = if (relayMode) c.sdp.contains(" typ relay") else (c.sdp.contains(" typ srflx") || c.sdp.contains(" typ relay"))
+            if (usable) main.post {
+                if (gatherCb != null && !graceScheduled) { graceScheduled = true; main.postDelayed({ finishGather() }, 1500) }
+            }
+        }
         override fun onIceCandidatesRemoved(c: Array<out IceCandidate>?) {}
         override fun onAddStream(s: MediaStream?) {}
         override fun onRemoveStream(s: MediaStream?) {}
@@ -300,8 +311,14 @@ class CallEngine(
 
     private fun waitGather(cb: (String) -> Unit) {
         gatherCb = cb
+        graceScheduled = false
         if (pc?.iceGatheringState() == PeerConnection.IceGatheringState.COMPLETE) finishGather()
-        else main.postDelayed({ finishGather() }, 7000)
+        else {
+            main.postDelayed({ finishGather() }, 4500)
+            val d = pc?.localDescription?.description ?: ""
+            val has = if (relayMode) d.contains(" typ relay") else (d.contains(" typ srflx") || d.contains(" typ relay"))
+            if (has) { graceScheduled = true; main.postDelayed({ finishGather() }, 1500) }
+        }
     }
 
     /** Summary of the ICE candidates inside the code just created (for troubleshooting). */

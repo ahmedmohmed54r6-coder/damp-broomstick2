@@ -34,7 +34,7 @@ class ChildListenService : Service() {
     companion object {
         @Volatile var running = false
         private const val ID = 78
-        private const val CH = "securecall_standby"
+        private const val CH = "securecall_standby_v18"
         private val RX = Regex("SKC[12]:[A-Za-z0-9_-]+")
 
         fun start(ctx: Context) {
@@ -58,16 +58,38 @@ class ChildListenService : Service() {
     private var liveId = ""
     private var liveUntil = 0L
     private var locating = false
+    private var lastNotificationState = true
+    private var lastNotificationAlert = 0L
+    private val healthTick = object : Runnable {
+        override fun run() {
+            try {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                val channelEnabled = if (Build.VERSION.SDK_INT >= 26) {
+                    nm.getNotificationChannel(CH)?.importance != NotificationManager.IMPORTANCE_NONE
+                } else true
+                val enabled = nm.areNotificationsEnabled() && channelEnabled
+                val now = System.currentTimeMillis()
+                if (!enabled && (lastNotificationState || now - lastNotificationAlert > 15 * 60 * 1000L)) {
+                    reply("msg", "A|notif_off|${now / 1000}")
+                    lastNotificationAlert = now
+                }
+                lastNotificationState = enabled
+            } catch (_: Exception) {}
+            main.postDelayed(this, 60_000L)
+        }
+    }
 
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val p = Store.prefs(this)
-        if (!p.getBoolean("cactive", false)) { stopSelf(); return START_NOT_STICKY }
+        val c = p.getString("ccode", "") ?: ""
+        val paired = p.getBoolean("cpaired", false) || c.isNotBlank()
+        if (!paired || c.isBlank()) { stopForeground(true); stopSelf(); return START_NOT_STICKY }
+        // V17 migration: an active child-mode pairing becomes a persistent background pairing.
+        if (!p.getBoolean("cpaired", false)) p.edit().putBoolean("cpaired", true).apply()
         Relay.load(p)
         goForeground()
-        val c = p.getString("ccode", "") ?: ""
-        if (c.isEmpty()) { stopSelf(); return START_NOT_STICKY }
         if (c != code || rv == null) {
             rv?.stop()
             code = c
@@ -76,13 +98,15 @@ class ChildListenService : Service() {
             r.subscribe(System.currentTimeMillis() / 1000 - 6 * 3600)
         }
         running = true
+        main.removeCallbacks(healthTick)
+        main.post(healthTick)
         return START_STICKY
     }
 
     private fun goForeground() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) {
-            val ch = NotificationChannel(CH, "وضع الطفل (جاهز لنداء الأهل)", NotificationManager.IMPORTANCE_MIN)
+            val ch = NotificationChannel(CH, "استقبال مكالمات الأهل", NotificationManager.IMPORTANCE_LOW)
             ch.setSound(null, null); ch.enableVibration(false); ch.setShowBadge(false)
             nm.createNotificationChannel(ch)
         }
@@ -93,8 +117,9 @@ class ChildListenService : Service() {
         val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CH)
         else Notification.Builder(this).setPriority(Notification.PRIORITY_MIN)
         b.setSmallIcon(android.R.drawable.stat_sys_phone_call)
-            .setContentTitle("SecureCall")
-            .setContentText("وضع الطفل: الهاتف جاهز لنداء الأهل")
+        if (Build.VERSION.SDK_INT >= 31) b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+        b.setContentTitle("SecureCall")
+            .setContentText("استقبال مكالمات الأهل يعمل في الخلفية")
             .setContentIntent(open).setOngoing(true)
         val n = b.build()
         if (Build.VERSION.SDK_INT >= 29) {
