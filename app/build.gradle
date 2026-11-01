@@ -1,7 +1,13 @@
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
-    id 'com.google.gms.google-services'
+}
+// Apply Google Services only when google-services.json exists, so the build never fails without it.
+// (Without the file the app still builds; instant-wake push is simply disabled.)
+if (file('google-services.json').exists()) {
+    apply plugin: 'com.google.gms.google-services'
+} else {
+    logger.warn('google-services.json not found -> building WITHOUT Firebase push wake-up')
 }
 android {
     namespace 'com.securecall.app'

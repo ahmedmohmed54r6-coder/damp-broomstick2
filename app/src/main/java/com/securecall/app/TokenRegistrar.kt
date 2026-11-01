@@ -16,12 +16,18 @@ object TokenRegistrar {
         val code = prefs.getString("ccode", "") ?: return
         if (code.isEmpty()) return
         val room = CallCrypto.roomId(code)
-        fun write(tok: String) {
-            FirebaseFirestore.getInstance().collection("fcm_tokens").document(room)
-                .set(mapOf("token" to tok, "updatedAt" to System.currentTimeMillis()))
-        }
-        if (token != null) { write(token); return }
-        com.google.firebase.messaging.FirebaseMessaging.getInstance().token
-            .addOnSuccessListener { write(it) }
+        // Firebase is optional: without google-services.json it is not initialised, so skip silently.
+        try {
+            if (com.google.firebase.FirebaseApp.getApps(context).isEmpty()) return
+            fun write(tok: String) {
+                try {
+                    FirebaseFirestore.getInstance().collection("fcm_tokens").document(room)
+                        .set(mapOf("token" to tok, "updatedAt" to System.currentTimeMillis()))
+                } catch (_: Throwable) {}
+            }
+            if (token != null) { write(token); return }
+            com.google.firebase.messaging.FirebaseMessaging.getInstance().token
+                .addOnSuccessListener { write(it) }
+        } catch (_: Throwable) {}
     }
 }
