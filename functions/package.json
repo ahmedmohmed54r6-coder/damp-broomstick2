@@ -1,8 +1,7 @@
 {
-  "name": "securecall-wake",
-  "private": true,
-  "main": "index.js",
+  "name": "securecall-functions",
   "engines": { "node": "20" },
+  "main": "index.js",
   "dependencies": {
     "firebase-admin": "^12.6.0",
     "firebase-functions": "^6.0.1"

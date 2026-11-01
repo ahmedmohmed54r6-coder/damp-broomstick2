@@ -1,0 +1,16 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // The app writes its own token via the Admin SDK path is NOT used client-side here —
+    // TokenRegistrar.kt uses the client SDK directly, so a child phone may write (and only
+    // write) its own token document; nobody may read tokens directly from a phone — only the
+    // Cloud Function (which runs with Admin privileges and bypasses these rules) may read them.
+    match /fcm_tokens/{roomId} {
+      allow get, list: if false;
+      allow create, update: if request.resource.data.keys().hasOnly(['token', 'updatedAt'])
+                              && request.resource.data.token is string
+                              && request.resource.data.updatedAt is number;
+      allow delete: if false;
+    }
+  }
+}

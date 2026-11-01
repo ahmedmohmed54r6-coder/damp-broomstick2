@@ -1,30 +1,41 @@
-// "Wake-up bell" for SecureCall Family. Receives { room } from the parent phone and rings the FCM topic
-// named after that mailbox id. The push carries no call data and no secret; the real call request is
-// still the encrypted message in the mailbox. The room id is a hash of the pairing code, so it can't be guessed.
-const { onRequest } = require("firebase-functions/v2/https");
-const { initializeApp } = require("firebase-admin/app");
-const { getMessaging } = require("firebase-admin/messaging");
+const functions = require("firebase-functions/v2/https");
+const admin = require("firebase-admin");
+admin.initializeApp();
 
-initializeApp();
-const last = new Map();
-
-exports.wake = onRequest({ maxInstances: 5, cors: false }, async (req, res) => {
+/**
+ * POST { roomId: "<the code-derived hash>" }
+ * Looks up that room's child token in Firestore (written by TokenRegistrar.kt on the child
+ * phone) and sends a bare data-only "ring" push — no call content, nothing identifying. The
+ * actual encrypted call request still travels separately through the existing ntfy.sh mailbox;
+ * this function's only job is to help Android wake the child app in time to read it.
+ *
+ * Deliberately minimal: no auth check beyond holding a valid roomId, because a roomId is already
+ * an unguessable hash of the family's own secret pairing code (nobody outside the two paired
+ * phones can derive it) — same trust model as the mailbox itself. If you want to harden this
+ * further (e.g. rate limiting per roomId), see the note at the bottom of functions/README.md.
+ */
+exports.sendWake = functions.onRequest({ cors: true }, async (req, res) => {
   if (req.method !== "POST") return res.status(405).send("POST only");
-  const room = String((req.body && req.body.room) || "");
-  if (!/^sc-[0-9a-f]{40}$/.test(room)) return res.status(400).send("bad room");
-  const now = Date.now();
-  if (now - (last.get(room) || 0) < 8000) return res.status(429).send("slow down");
-  last.set(room, now);
-  if (last.size > 5000) last.clear();
+  const roomId = (req.body && req.body.roomId || "").toString();
+  if (!/^sc-[0-9a-f]{40}$/.test(roomId)) return res.status(400).send("bad roomId");
+
+  const doc = await admin.firestore().collection("fcm_tokens").doc(roomId).get();
+  if (!doc.exists) return res.status(404).send("no token registered for this room yet");
+  const token = doc.data().token;
+  if (!token) return res.status(404).send("no token");
+
   try {
-    await getMessaging().send({
-      topic: room,
-      data: { w: "1", t: String(now), q: req.body.silent === true ? "1" : "0" },
-      android: { priority: "high", ttl: 60000 },
+    await admin.messaging().send({
+      token,
+      data: { type: "ring" },
+      android: { priority: "high" },
     });
-    return res.status(200).send("ok");
+    res.status(200).send("ok");
   } catch (e) {
-    console.error(e);
-    return res.status(500).send("fail");
+    // A stale/uninstalled token is expected over time; clear it so we stop trying.
+    if (e.code === "messaging/registration-token-not-registered") {
+      await admin.firestore().collection("fcm_tokens").doc(roomId).delete();
+    }
+    res.status(500).send(String(e));
   }
 });

@@ -1,6 +1,7 @@
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
+    id 'com.google.gms.google-services'
 }
 android {
     namespace 'com.securecall.app'
@@ -9,8 +10,8 @@ android {
         applicationId "com.securecall.app"
         minSdk 24
         targetSdk 34
-        versionCode 17
-        versionName "2.6"
+        versionCode 13
+        versionName "2.2"
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
     }
     buildTypes { release { minifyEnabled false } }
@@ -23,34 +24,8 @@ android {
 dependencies {
     implementation 'io.getstream:stream-webrtc-android:1.1.1'
     implementation 'androidx.security:security-crypto:1.1.0-alpha06'
-    // QR pairing (generate + scan, works without Google Play services)
-    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
-    // FCM "wake-up bell" (inactive unless app/google-services.json is present)
+    implementation 'com.google.zxing:core:3.5.3'
     implementation platform('com.google.firebase:firebase-bom:33.5.1')
-    implementation 'com.google.firebase:firebase-messaging'
+    implementation 'com.google.firebase:firebase-messaging-ktx'
+    implementation 'com.google.firebase:firebase-firestore-ktx'
 }
-
-// Firebase is optional: the plugin is applied only when you add app/google-services.json (see SETUP_FCM.md)
-if (file('google-services.json').exists()) {
-    apply plugin: 'com.google.gms.google-services'
-}
-
-// Arabic UI font: Noto Naskh Arabic (SIL OFL 1.1), downloaded once at build time into assets/fonts/.
-// If the download fails the app still builds and falls back to the system serif (Naskh on most phones).
-def naskhFile = file('src/main/assets/fonts/naskh.ttf')
-tasks.register('downloadNaskh') {
-    outputs.file(naskhFile)
-    doLast {
-        if (naskhFile.exists() && naskhFile.length() > 50000) return
-        try {
-            naskhFile.parentFile.mkdirs()
-            def tmp = new File(naskhFile.parentFile, 'naskh.tmp')
-            new URL('https://raw.githubusercontent.com/google/fonts/main/ofl/notonaskharabic/NotoNaskhArabic%5Bwght%5D.ttf')
-                .withInputStream { i -> tmp.withOutputStream { o -> o << i } }
-            if (tmp.length() > 50000) tmp.renameTo(naskhFile) else tmp.delete()
-        } catch (Exception e) {
-            logger.warn("Naskh font download failed (${e.message}); using the system font")
-        }
-    }
-}
-tasks.matching { it.name == 'preBuild' }.configureEach { dependsOn 'downloadNaskh' }
