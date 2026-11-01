@@ -30,6 +30,7 @@ import android.view.View
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.widget.*
+import com.google.zxing.integration.android.IntentIntegrator
 import org.json.JSONArray
 import org.json.JSONObject
 import org.webrtc.EglBase
@@ -63,6 +64,7 @@ class MainActivity : Activity() {
     private lateinit var childPin: EditText
     private lateinit var turnP: EditText
     private lateinit var turnC: EditText
+    private lateinit var wakeUrl: EditText
     private lateinit var statusP: TextView
     private lateinit var standbyTitle: TextView
     private lateinit var standbyStatus: TextView
@@ -78,7 +80,11 @@ class MainActivity : Activity() {
     private lateinit var locCard: LinearLayout
     private lateinit var locView: TextView
 
-    private val prefs by lazy { getSharedPreferences("cfg", MODE_PRIVATE) }
+    /** Encrypted at rest (AES-256-GCM, AndroidX Security, key held in the hardware Keystore) —
+     *  this is where the pairing code (the master secret), child name and PIN hash live, so a
+     *  plain root/backup file read on the device no longer exposes them in clear text. Falls back
+     *  to a normal file only if the Keystore itself is unavailable (very old/broken devices). */
+    private val prefs by lazy { Store.prefs(this) }
     private val ui = Handler(Looper.getMainLooper())
 
     private var mode = 0                // 1 = parent, 2 = child
@@ -114,6 +120,11 @@ class MainActivity : Activity() {
     private var savedSpeaker = false
     private var savedVol = -1
     private var rv: Rendezvous? = null
+    private var notifWasEnabled = true
+    private var lastNotifAlertMs = 0L
+    /** Parent only: one quiet mailbox listener per saved child, active while the parent screen is
+     *  open, so an "A|notif_off" alert from any of them is caught even outside an active call. */
+    private val parentWatchers = mutableMapOf<String, Rendezvous>()
     private var auto = false
     private var waitingPeer = false
     private var waitingOffer = false
@@ -122,6 +133,13 @@ class MainActivity : Activity() {
     private var waitStart = 0L
     private val seen = mutableSetOf<String>()
     private var svcOn = false
+    private var lastHbMs = 0L
+    private var cfBusy = false
+    private var lastCfTry = 0L
+    private val seenLabels = mutableMapOf<String, TextView>()
+    private val offlineAlerted = mutableSetOf<String>()
+    private var tickerOn = false
+    private var watchStartMs = 0L
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -137,10 +155,12 @@ class MainActivity : Activity() {
         when {
             mode == 2 && prefs.getBoolean("cactive", false) &&
                 hasPerms(listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)) -> activateChild()
-            mode == 1 -> { refreshParent(); show(parentScreen) }
+            mode == 1 -> { refreshParent(); show(parentScreen); startParentWatchers() }
             mode == 2 -> show(childSetup)
             else -> show(modeScreen)
         }
+        handleWakeIntent(intent)
+        ui.postDelayed(notifWatchTick, 20000)
     }
 
     // ---------- design ----------
@@ -245,10 +265,115 @@ class MainActivity : Activity() {
 
     private fun turnField(): EditText = field("turn:host:3478,user,pass").apply {
         textSize = 12f
+        minLines = 2; maxLines = 5
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         typeface = Typeface.MONOSPACE
         textDirection = View.TEXT_DIRECTION_LTR
         setText(prefs.getString("turn", "") ?: "")
     }
+
+    private fun chip(t: String, onClick: () -> Unit): TextView = pill(t, false, onClick).apply {
+        textSize = 12f; setPadding(dp(6), dp(11), dp(6), dp(11))
+    }
+
+    private fun chipRow(vararg chips: View): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        chips.forEachIndexed { i, c ->
+            addView(c, LinearLayout.LayoutParams(0, -2, 1f).apply { if (i > 0) marginStart = dp(6) })
+        }
+    }
+
+    private fun clipText(): String {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        return cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
+    }
+
+    /** One-tap helpers under the TURN field: paste (iceServers JSON or "url,user,pass" lines), free
+     *  sign-up pages, Cloudflare auto-renewal, a real relay test, and copy to the other phone. */
+    private fun turnBar(target: EditText): LinearLayout {
+        val paste = chip("📋 لصق") {
+            val norm = normalizeTurn(clipText())
+            if (norm.isEmpty()) toast("الحافظة لا تحتوي إعداد TURN. انسخه من لوحة المزوّد ثم اضغط لصق.")
+            else { target.setText(norm); toast("تم ضبط خادم TURN ✓ — اضغط اختبار للتأكد") }
+        }
+        val copyB = chip("📤 نسخ") {
+            val t = normalizeTurn(target.text.toString())
+            if (t.isEmpty()) toast("لا يوجد إعداد لنسخه") else copy(t)
+        }
+        val clear = chip("🗑 مسح") { target.setText("") }
+        val metered = chip("☁ Metered مجاني") { openUrl("https://dashboard.metered.ca/signup") }
+        val cf = chip("☁ Cloudflare تلقائي") { cloudflareDialog() }
+        val test = chip("🧪 اختبار") { testTurn(target) }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(chipRow(paste, copyB, clear))
+            addView(chipRow(metered, cf, test), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+            addView(label("Metered: أنشئ حساباً مجانياً، انسخ iceServers، ثم «لصق». Cloudflare: أدخل المعرّف والتوكن مرة واحدة " +
+                "فيجدّد التطبيق البيانات تلقائياً. «اختبار» يتأكد أن الخادم يعطي مسار relay فعلاً.", 11f, MUTED, false),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            val cfOn = Turn.cfConfigured(prefs)
+            if (cfOn) addView(label("☁ Cloudflare التلقائي مفعّل ✓", 11f, ACCENT, true),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        }
+    }
+
+    private fun cloudflareDialog() {
+        fun mono(hint: String) = field(hint).apply {
+            textSize = 12f; typeface = Typeface.MONOSPACE; textDirection = View.TEXT_DIRECTION_LTR
+        }
+        val idF = mono("Turn Token ID").apply { setText(prefs.getString("cf_id", "") ?: "") }
+        val tkF = mono("API Token").apply {
+            setText(prefs.getString("cf_tok", "") ?: "")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(10), dp(18), 0)
+            addView(label("أنشئ «TURN key» في لوحة Cloudflare (Realtime ← TURN) والصق المعرّف والتوكن هنا. " +
+                "يجدّد التطبيق بيانات TURN القصيرة العمر تلقائياً كل يوم.", 12f, MUTED, false))
+            addView(idF, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+            addView(tkF, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Cloudflare TURN (تلقائي)")
+            .setView(box)
+            .setPositiveButton("حفظ وجلب") { _, _ ->
+                prefs.edit().putString("cf_id", idF.text.toString().trim())
+                    .putString("cf_tok", tkF.text.toString().trim()).putLong("cf_exp", 0L).apply()
+                if (Turn.cfConfigured(prefs)) {
+                    toast("جارٍ جلب بيانات TURN...")
+                    Turn.cfRefresh(prefs) { ok, m -> toast(if (ok) "تم جلب بيانات TURN ✓ وستتجدد تلقائياً" else "فشل: $m") }
+                }
+            }
+            .setNeutralButton("صفحة الشرح") { _, _ -> openUrl("https://developers.cloudflare.com/realtime/turn/generate-credentials/") }
+            .setNegativeButton("إزالة") { _, _ ->
+                prefs.edit().remove("cf_id").remove("cf_tok").remove("cf_lines").remove("cf_exp").apply()
+                toast("أُزيل Cloudflare")
+            }
+            .show()
+    }
+
+    private fun testTurn(target: EditText) {
+        if (engine != null) { toast("أنهِ المكالمة الحالية أولاً"); return }
+        if (Turn.cfConfigured(prefs) && Turn.cfCached(prefs).isEmpty()) {
+            toast("جارٍ جلب بيانات Cloudflare...")
+            Turn.cfRefresh(prefs) { ok, m -> if (ok) testTurn(target) else toast(m) }
+            return
+        }
+        val servers = Turn.build(target.text.toString(), Turn.cfCached(prefs), false)
+        if (servers.isEmpty()) { toast("أضف خادم TURN أولاً (لصق أو Cloudflare)"); return }
+        toast("جارٍ الاختبار... (حتى ١٢ ثانية)")
+        Turn.test(this, servers) { _, m ->
+            AlertDialog.Builder(this).setMessage(m).setPositiveButton("حسناً", null).show()
+        }
+    }
+
+    private fun openUrl(u: String) {
+        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+        catch (_: Exception) { copy(u) }
+    }
+
+    private fun normalizeTurn(raw: String): String = Turn.normalize(raw)
 
     private fun statusBox(): TextView = label("", 13f, Color.WHITE, false).apply {
         background = rounded(Color.parseColor("#12304A"), 14, Color.parseColor("#1D4E7A"))
@@ -299,10 +424,25 @@ class MainActivity : Activity() {
         )
         turnP = turnField()
         pc.addView(
-            card("خادم TURN (اختياري، موصى به)", turnP,
+            card("خادم TURN (اختياري، موصى به)", turnP, turnBar(turnP),
                 label("يجعل الاتصال يعمل على بيانات الجوال وبين الشبكات المختلفة. ضعه على الهاتفين.", 11.5f, MUTED, false)),
             cardLp()
         )
+        wakeUrl = field("https://...run.app").apply {
+            textSize = 12f; typeface = Typeface.MONOSPACE; textDirection = View.TEXT_DIRECTION_LTR
+            setText(prefs.getString("wake_url", "") ?: "")
+        }
+        pc.addView(
+            card("⚡ إيقاظ فوري عبر FCM (اختياري)", wakeUrl,
+                chipRow(
+                    chip("📋 لصق") { val t = clipText().trim(); if (t.startsWith("https://")) wakeUrl.setText(t) else toast("انسخ رابط الدالة أولاً") },
+                    chip("🧪 اختبار") {
+                        Fcm.wakeRoom(wakeUrl.text.toString(), "sc-" + "0".repeat(40)) { ok, m ->
+                            runOnUiThread { toast(if (ok) "✅ الدالة تعمل ($m)" else "❌ فشل: $m") }
+                        }
+                    }),
+                label("يوقظ هاتف الطفل فوراً حتى لو أغلقه نظام الهاتف. يحتاج إعداد Firebase مرة واحدة (SETUP_FCM.md).", 11.5f, MUTED, false)),
+            cardLp())
         statusP = statusBox()
         pc.addView(statusP, cardLp())
         pc.addView(pill("⬅ تغيير دور الهاتف", false) { show(modeScreen) }, cardLp(18))
@@ -311,6 +451,7 @@ class MainActivity : Activity() {
         // ---------- child setup screen ----------
         val cc = screenCol()
         cc.addView(header("هاتف الطفل", "إعداد لمرة واحدة"))
+        cc.addView(pill("📷 مسح رمز QR من هاتف الأهل (الأسرع)", true) { startQrScan() }, cardLp(18))
         childName = field("اسم الطفل (كما سيظهر عند الأهل)").apply {
             setText(prefs.getString("cname", "") ?: "")
         }
@@ -331,7 +472,7 @@ class MainActivity : Activity() {
             cardLp()
         )
         turnC = turnField()
-        cc.addView(card("٤ · خادم TURN (اختياري)", turnC), cardLp())
+        cc.addView(card("٤ · خادم TURN (اختياري)", turnC, turnBar(turnC)), cardLp())
         cc.addView(pill("✅ تفعيل وضع الطفل", true) { onActivateChild() }, cardLp(18))
         cc.addView(
             pill("🔋 استثناء التطبيق من توفير البطارية", false) {
@@ -491,7 +632,7 @@ class MainActivity : Activity() {
     private fun setMode(m: Int) {
         mode = m
         prefs.edit().putInt("mode", m).apply()
-        if (m == 1) { refreshParent(); show(parentScreen) } else show(childSetup)
+        if (m == 1) { refreshParent(); show(parentScreen); startParentWatchers() } else show(childSetup)
     }
 
     // ---------- parent: children list ----------
@@ -515,8 +656,77 @@ class MainActivity : Activity() {
         prefs.edit().putString("kids", a.toString()).apply()
     }
 
+    /** Starts (or re-syncs) one listener per saved child. Safe to call repeatedly — already-running
+     *  listeners for kids still on the list are left alone; a kid removed from the list has its
+     *  listener stopped. */
+    private fun startParentWatchers() {
+        val codes = loadKids().associateBy { it.code }
+        val gone = parentWatchers.keys - codes.keys
+        gone.forEach { parentWatchers.remove(it)?.stop() }
+        codes.values.forEach { k ->
+            if (parentWatchers.containsKey(k.code)) return@forEach
+            val r = Rendezvous(CallCrypto.roomId(k.code), { raw -> handleChildAlert(k, raw) }, { })
+            r.subscribe(System.currentTimeMillis() / 1000 - 1200)   // 20 min back: learns the latest heartbeat
+            parentWatchers[k.code] = r
+        }
+        if (!tickerOn) { tickerOn = true; watchStartMs = System.currentTimeMillis(); ui.post(seenTick) }
+    }
+
+    private fun stopParentWatchers() {
+        tickerOn = false
+        ui.removeCallbacks(seenTick)
+        parentWatchers.values.forEach { it.stop() }
+        parentWatchers.clear()
+    }
+
+    private fun handleChildAlert(k: Kid, raw: String) {
+        val t = Regex("SKC1:[A-Za-z0-9_-]+").find(CallCrypto.clean(raw))?.value ?: return
+        val p = try { CallCrypto.open(k.code, "msg", null, t, 20 * 60 * 1000L) } catch (_: Exception) { return }
+        val f = p.split("|")
+        if (f.size < 3 || f[0] != "A" || !seen.add(t)) return
+        when (f[1]) {
+            "notif_off" -> {
+                val ts = f[2].toLongOrNull() ?: 0L
+                if (System.currentTimeMillis() / 1000 - ts < 120) runOnUiThread { alertNotificationsDisabled(k.name) }
+            }
+            "hb" -> {
+                val tsMs = (f[2].toLongOrNull() ?: return) * 1000L
+                val room = CallCrypto.roomId(k.code)
+                val batt = f.getOrNull(3)?.toIntOrNull() ?: -1
+                if (tsMs > prefs.getLong("seen_$room", 0L))
+                    prefs.edit().putLong("seen_$room", tsMs).putInt("batt_$room", batt).apply()
+                runOnUiThread { updateSeenLabels() }
+            }
+        }
+    }
+
+    private fun alertNotificationsDisabled(childName: String) {
+        val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale("ar")).format(java.util.Date())
+        val title = "تنبيه: $childName عطّل إشعارات SecureCall"
+        val text = "الساعة $time. السحب السريع للكاميرا/المايكروفون قد يختفي معه. تواصل معه مباشرة إن احتجت."
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            if (android.os.Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(
+                android.app.NotificationChannel("securecall_alert", "تنبيهات SecureCall", android.app.NotificationManager.IMPORTANCE_HIGH))
+            val open = android.app.PendingIntent.getActivity(
+                this, 3, Intent(this, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val b = if (android.os.Build.VERSION.SDK_INT >= 26) android.app.Notification.Builder(this, "securecall_alert")
+            else android.app.Notification.Builder(this).setPriority(android.app.Notification.PRIORITY_HIGH)
+            b.setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentTitle(title).setContentText(text)
+                .setStyle(android.app.Notification.BigTextStyle().bigText(text))
+                .setContentIntent(open).setAutoCancel(true)
+            nm.notify(("alert_" + childName).hashCode(), b.build())
+        } catch (_: Exception) {}
+        if (parentScreen.visibility == View.VISIBLE) toast(title)
+    }
+
     private fun refreshParent() {
         parentList.removeAllViews()
+        seenLabels.clear()
         val kids = loadKids()
         if (kids.isEmpty()) {
             parentList.addView(label("لا يوجد أطفال بعد. أضف طفلاً من الأسفل.", 13f, MUTED, false))
@@ -537,7 +747,9 @@ class MainActivity : Activity() {
             val locRow = row("📍 موقعه الآن" to { requestLocation(k, false) }, "📡 تتبع مباشر" to { requestLocation(k, true) })
             val manageRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                addView(pill("📋 رمز الاقتران", false) { showKidCode(k) },
+                addView(pill("📋 الرمز", false) { showKidCode(k) },
+                    LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+                addView(pill("📷 QR", false) { showKidQr(k) },
                     LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
                 addView(pill("🗑 حذف", false) {
                     AlertDialog.Builder(this@MainActivity)
@@ -549,8 +761,111 @@ class MainActivity : Activity() {
                         .setNegativeButton("إلغاء", null).show()
                 }, LinearLayout.LayoutParams(0, -2, 1f))
             }
-            parentList.addView(card("🧒 ${k.name}", callRow, watchRow, locRow, manageRow), cardLp(10))
+            val seen = label("", 12f, MUTED, false)
+            seenLabels[k.code] = seen
+            parentList.addView(card("🧒 ${k.name}", seen, callRow, watchRow, locRow, manageRow), cardLp(10))
         }
+        updateSeenLabels()
+    }
+
+    private fun showKidQr(k: Kid) {
+        val payload = Qr.encode(k.name, k.code, normalizeTurn(prefs.getString("turn", "") ?: ""),
+            prefs.getString("cf_id", "") ?: "", prefs.getString("cf_tok", "") ?: "")
+        val bmp = try { Qr.bitmap(payload, 720) } catch (e: Exception) { toast("الرمز كبير جداً. قلّل إعدادات TURN"); return }
+        val img = ImageView(this).apply {
+            setImageBitmap(bmp); setBackgroundColor(Color.WHITE)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(16), dp(12), dp(16), 0)
+            addView(label("امسحه من هاتف ${k.name} (وضع الطفل ← مسح QR). يحوي الرمز السري: لا تصوّره ولا ترسله.", 12f, MUTED, false))
+            addView(img, LinearLayout.LayoutParams(dp(280), dp(280)).apply { topMargin = dp(10) })
+        }
+        val d = AlertDialog.Builder(this).setTitle("QR اقتران ${k.name}").setView(box)
+            .setPositiveButton("إغلاق", null).create()
+        d.window?.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        d.show()
+    }
+
+    private fun startQrScan() {
+        try {
+            IntentIntegrator(this).setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
+                .setPrompt("وجّه الكاميرا نحو رمز QR المعروض في هاتف الأهل")
+                .setBeepEnabled(false).setOrientationLocked(false).initiateScan()
+        } catch (e: Exception) { toast("تعذّر فتح الماسح") }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(rc: Int, res: Int, data: Intent?) {
+        super.onActivityResult(rc, res, data)
+        val r = IntentIntegrator.parseActivityResult(rc, res, data) ?: return
+        val txt = r.contents ?: return
+        val j = Qr.decode(txt)
+        if (j == null) { toast("هذا ليس رمز اقتران SecureCall"); return }
+        childName.setText(j.optString("n")); childCode.setText(j.optString("c"))
+        if (j.has("t")) turnC.setText(j.optString("t"))
+        if (j.has("ci") && j.has("ct")) {
+            prefs.edit().putString("cf_id", j.optString("ci")).putString("cf_tok", j.optString("ct")).putLong("cf_exp", 0L).apply()
+            Turn.cfRefresh(prefs) { _, _ -> }
+        }
+        toast("تم ملء البيانات ✓ أدخل رمز PIN ثم اضغط تفعيل")
+    }
+
+    // ---------- parent: is the child phone online? (heartbeat every ~5 min) ----------
+    private val seenTick = object : Runnable {
+        override fun run() { updateSeenLabels(); ui.postDelayed(this, 30000) }
+    }
+
+    private fun fmtAge(min: Long) = if (min < 60) "$min د" else "${min / 60} س"
+
+    private fun updateSeenLabels() {
+        val now = System.currentTimeMillis()
+        loadKids().forEach { k ->
+            val room = CallCrypto.roomId(k.code)
+            val ts = prefs.getLong("seen_$room", 0L)
+            val batt = prefs.getInt("batt_$room", -1)
+            val bt = if (batt >= 0) " · 🔋 $batt%" else ""
+            val age = if (ts == 0L) -1L else maxOf(0L, (now - ts) / 60000)
+            val lbl = seenLabels[k.code]
+            when {
+                ts == 0L -> { lbl?.text = "⚪ لا توجد إشارة بعد (تظهر خلال ٥ دقائق من تشغيل وضع الطفل بنسخة V14)"; lbl?.setTextColor(MUTED) }
+                age < 8 -> { lbl?.text = "🟢 متصل · آخر إشارة قبل ${fmtAge(age)}$bt"; lbl?.setTextColor(ACCENT) }
+                else -> { lbl?.text = "🔴 غير متصل منذ ${fmtAge(age)}$bt"; lbl?.setTextColor(DANGER) }
+            }
+            if (ts != 0L && age >= 15 && now - watchStartMs > 25000L) {
+                if (offlineAlerted.add(k.code))
+                    postAlert("off_" + k.name, "هاتف ${k.name} غير متصل",
+                        "لم تصل منه إشارة منذ ${fmtAge(age)}. قد لا تصل المكالمة حتى يعود للاتصال بالإنترنت.")
+            } else if (age in 0L..7L) offlineAlerted.remove(k.code)
+        }
+    }
+
+    private fun postAlert(key: String, title: String, text: String) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            if (android.os.Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(
+                android.app.NotificationChannel("securecall_alert", "تنبيهات SecureCall", android.app.NotificationManager.IMPORTANCE_HIGH))
+            val open = android.app.PendingIntent.getActivity(
+                this, 3, Intent(this, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val b = if (android.os.Build.VERSION.SDK_INT >= 26) android.app.Notification.Builder(this, "securecall_alert")
+            else android.app.Notification.Builder(this).setPriority(android.app.Notification.PRIORITY_HIGH)
+            b.setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentTitle(title).setContentText(text)
+                .setStyle(android.app.Notification.BigTextStyle().bigText(text))
+                .setContentIntent(open).setAutoCancel(true)
+            nm.notify(key.hashCode(), b.build())
+        } catch (_: Exception) {}
+    }
+
+    private fun batteryPct(): Int {
+        val i = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return -1
+        val l = i.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+        val sc = i.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1)
+        return if (l < 0 || sc <= 0) -1 else l * 100 / sc
     }
 
     private fun addKid() {
@@ -632,25 +947,43 @@ class MainActivity : Activity() {
         try { stopService(Intent(this, CallService::class.java)) } catch (_: Exception) {}
     }
 
-    private fun iceServers(): List<PeerConnection.IceServer> {
-        val list = mutableListOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
-        )
-        val t = (prefs.getString("turn", "") ?: "").trim()
-        if (t.isNotEmpty()) {
-            val p = t.split(",").map { it.trim() }
-            val b = PeerConnection.IceServer.builder(p[0])
-            if (p.size >= 3) { b.setUsername(p[1]); b.setPassword(p[2]) }
-            list.add(b.createIceServer())
-        }
-        return list
+    private fun iceServers(): List<PeerConnection.IceServer> = Turn.iceServers(prefs)
+
+    /** PIN hashing: PBKDF2-HMAC-SHA256, 120,000 rounds, random 16-byte salt per install — far
+     *  slower to brute-force than a single SHA-256 pass, and the salt stops a precomputed table
+     *  from working even if the stored hash is ever read. */
+    private fun hashPin(pin: String, saltHex: String): String {
+        val salt = saltHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val spec = javax.crypto.spec.PBEKeySpec(pin.toCharArray(), salt, 120_000, 256)
+        val key = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+        return key.joinToString("") { "%02x".format(it) }
     }
 
-    private fun sha(s: String): String =
-        MessageDigest.getInstance("SHA-256").digest(("sc-pin|$s").toByteArray()).joinToString("") { "%02x".format(it) }
+    private fun newSalt(): String {
+        val b = ByteArray(16); java.security.SecureRandom().nextBytes(b)
+        return b.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun setPin(pin: String) {
+        val salt = newSalt()
+        prefs.edit().putString("pinsalt", salt).putString("pinh", hashPin(pin, salt)).apply()
+    }
+
+    private fun checkPin(pin: String): Boolean {
+        val salt = prefs.getString("pinsalt", "") ?: ""
+        val stored = prefs.getString("pinh", "") ?: ""
+        if (salt.isEmpty() || stored.isEmpty()) return false
+        return hashPin(pin, salt) == stored
+    }
 
     private fun askPin(onOk: () -> Unit) {
+        val fails = prefs.getInt("pinfails", 0)
+        val lockUntil = prefs.getLong("pinlock", 0L)
+        if (lockUntil > System.currentTimeMillis()) {
+            val mins = (lockUntil - System.currentTimeMillis()) / 60000 + 1
+            toast("عدة محاولات خاطئة. حاول بعد $mins دقيقة.")
+            return
+        }
         val et = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
             hint = "PIN"
@@ -659,8 +992,19 @@ class MainActivity : Activity() {
             .setTitle("أدخل رمز PIN الخاص بالأهل")
             .setView(et)
             .setPositiveButton("موافق") { _, _ ->
-                if (sha(et.text.toString()) == (prefs.getString("pinh", "") ?: "")) onOk()
-                else toast("رمز PIN غير صحيح")
+                if (checkPin(et.text.toString())) {
+                    prefs.edit().putInt("pinfails", 0).apply()
+                    onOk()
+                } else {
+                    val n = fails + 1
+                    val e = prefs.edit().putInt("pinfails", n)
+                    // backs off: 5th wrong try locks 1 min, 10th locks 10 min, 15th+ locks 30 min
+                    if (n >= 15) e.putLong("pinlock", System.currentTimeMillis() + 30 * 60000)
+                    else if (n >= 10) e.putLong("pinlock", System.currentTimeMillis() + 10 * 60000)
+                    else if (n >= 5) e.putLong("pinlock", System.currentTimeMillis() + 60000)
+                    e.apply()
+                    toast("رمز PIN غير صحيح")
+                }
             }
             .setNegativeButton("إلغاء", null).show()
     }
@@ -680,24 +1024,128 @@ class MainActivity : Activity() {
         if (!CallCrypto.isStrong(code)) { toast("رمز الاقتران غير صالح. انسخه من هاتف الأهل كما هو."); return }
         val hasPin = (prefs.getString("pinh", "") ?: "").isNotEmpty()
         if (pin.length < 4 && !(hasPin && pin.isEmpty())) { toast("رمز PIN يجب أن يكون 4 أرقام على الأقل"); return }
-        val e = prefs.edit()
+        prefs.edit()
             .putString("cname", name).putString("ccode", code)
             .putString("turn", turnC.text.toString()).putBoolean("cactive", true)
-        if (pin.isNotEmpty()) e.putString("pinh", sha(pin))
-        e.apply()
+            .apply()
+        if (pin.isNotEmpty()) setPin(pin)
         ensurePerms(
             listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
             listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         ) { activateChild() }
     }
 
+    /** Once, right after activating child mode: asks (via the real system dialogs — nothing silent)
+     *  to be excluded from battery optimization, and on manufacturers known to kill background apps
+     *  aggressively (Xiaomi, Huawei/Honor, Oppo, Vivo, OnePlus, ...), offers to open that phone's own
+     *  "autostart / keep running" settings screen. Both are the user's own call-to-action; nothing here
+     *  bypasses what the person chooses on those screens. This is also exactly why a call may not reach
+     *  a child's phone unless the app is already open on some of these ROMs when these are skipped. */
+    private fun maybeAskBackgroundReliability() {
+        if (prefs.getBoolean("askedBgReliability", false)) return
+        prefs.edit().putBoolean("askedBgReliability", true).apply()
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        val needsBattery = !pm.isIgnoringBatteryOptimizations(packageName)
+        val needsAutostart = autoStartIntent() != null
+        if (!needsBattery && !needsAutostart) return
+        AlertDialog.Builder(this)
+            .setTitle("مهم لضمان وصول نداء الأهل")
+            .setMessage(
+                "بعض الهواتف (خصوصًا شاومي/هواوي/أوبو/فيفو) توقف التطبيقات بالخلفية تلقائيًا إلا لو " +
+                "استثنيتها بنفسك. بدون هذا، ممكن ما يرن التطبيق إلا لو كان مفتوحًا فعليًا.\n\n" +
+                "الخطوتين التاليتين من إعدادات هاتفك مباشرة (مش من داخل تطبيقنا):"
+            )
+            .setPositiveButton("افتح الإعدادات") { _, _ ->
+                if (needsBattery) requestBatteryExemption()
+                if (needsAutostart) ui.postDelayed({ openAutoStartSettings() }, if (needsBattery) 1200 else 0)
+            }
+            .setNegativeButton("لاحقًا", null)
+            .show()
+    }
+
+    private fun requestBatteryExemption() {
+        try {
+            startActivity(Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(Uri.parse("package:$packageName")))
+        } catch (_: Exception) {
+            try { startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+            catch (_: Exception) {}
+        }
+    }
+
+    /** Known per-manufacturer "autostart / protected apps" screens. Returns the first one that
+     *  actually resolves on this device, or null if none match (most phones don't need this). */
+    private fun autoStartIntent(): Intent? {
+        val candidates = listOf(
+            "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity",
+            "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+            "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
+            "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+            "com.oppo.safe" to "com.oppo.safe.permission.startup.StartupAppListActivity",
+            "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+            "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity",
+            "com.oneplus.security" to "com.oneplus.security.chainlaunch.view.ChainLaunchAppListActivity",
+            "com.letv.android.letvsafe" to "com.letv.android.letvsafe.AutobootManageActivity",
+            "com.asus.mobilemanager" to "com.asus.mobilemanager.autostart.AutoStartActivity"
+        )
+        val pm = packageManager
+        for ((pkg, cls) in candidates) {
+            val i = Intent().setComponent(android.content.ComponentName(pkg, cls))
+            if (i.resolveActivity(pm) != null) return i
+        }
+        return null
+    }
+
+    private fun openAutoStartSettings() {
+        val i = autoStartIntent()
+        if (i != null) {
+            try { startActivity(i); return } catch (_: Exception) {}
+        }
+        try { startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData(Uri.parse("package:$packageName"))) } catch (_: Exception) {}
+        toast("دوّر على \"بدء تلقائي\" أو \"تشغيل بالخلفية\" في إعدادات هذا التطبيق")
+    }
+
+    /** Android 14+: a call-style full-screen notification needs the user's OK in a system screen. */
+    private fun maybeAskFullScreen() {
+        if (android.os.Build.VERSION.SDK_INT < 34 || !Fcm.available(this)) return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        if (nm.canUseFullScreenIntent() || prefs.getBoolean("askedFsi", false)) return
+        prefs.edit().putBoolean("askedFsi", true).apply()
+        AlertDialog.Builder(this)
+            .setTitle("السماح بفتح التطبيق عند نداء الأهل")
+            .setMessage("حتى يظهر التطبيق على الشاشة فور النداء، فعّل «إشعارات ملء الشاشة» لهذا التطبيق في الشاشة التالية.")
+            .setPositiveButton("فتح الإعداد") { _, _ ->
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+                } catch (_: Exception) {}
+            }
+            .setNegativeButton("لاحقاً", null).show()
+    }
+
+    private fun handleWakeIntent(i: Intent?) {
+        val ii = i ?: return
+        if (!ii.getBooleanExtra("wake", false)) return
+        if (android.os.Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
+        else window.addFlags(
+            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD)
+        ii.removeExtra("wake")
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleWakeIntent(intent)
+    }
+
     private fun activateChild() {
         mode = 2
         curName = prefs.getString("cname", "") ?: ""
         curCode = prefs.getString("ccode", "") ?: ""
-        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName))
-            toast("لاستمرار الاتصال والحفاظ على البطارية: استثنِ التطبيق من توفير البطارية (زر في صفحة الإعداد)")
+        Fcm.subscribe(this, curCode)
+        maybeAskBackgroundReliability()
+        maybeAskFullScreen()
         requestUninstallProtection()
         dim(true)
         standbyTitle.text = "هاتف $curName"
@@ -712,6 +1160,7 @@ class MainActivity : Activity() {
             val admin = android.content.ComponentName(this, ChildDeviceAdmin::class.java)
             if (dpm.isAdminActive(admin)) dpm.removeActiveAdmin(admin)
         } catch (_: Exception) {}
+        Fcm.unsubscribe(this, prefs.getString("ccode", "") ?: "")
         prefs.edit().putBoolean("cactive", false).apply()
         resetCall()
         inSession = false
@@ -757,12 +1206,19 @@ class MainActivity : Activity() {
     // ---------- parent: start a call ----------
     private fun callKid(k: Kid, type: String) {
         curName = k.name; curCode = k.code; callType = type; wantVideo = type == "v"
-        prefs.edit().putString("turn", turnP.text.toString()).apply()
+        prefs.edit().putString("turn", turnP.text.toString()).putString("wake_url", wakeUrl.text.toString().trim()).apply()
         stopLocWatch(false)
-        ensurePerms(listOf(Manifest.permission.RECORD_AUDIO)) {
-            startCallService(false)
-            startParentCall()
+        val go = {
+            ensurePerms(listOf(Manifest.permission.RECORD_AUDIO)) {
+                startCallService(false)
+                startParentCall()
+                Fcm.wake(prefs.getString("wake_url", "") ?: "", k.code)   // wake-up bell, in parallel with the normal request
+            }
         }
+        if (Turn.cfConfigured(prefs) && Turn.cfCached(prefs).isEmpty()) {
+            toast("جارٍ تجديد بيانات TURN...")
+            Turn.cfRefresh(prefs) { _, _ -> go() }
+        } else go()
     }
 
     private fun parentHello() = "P|$myId|parent|$callType"
@@ -806,6 +1262,36 @@ class MainActivity : Activity() {
             }
             sendHello(parentHello())
             ui.postDelayed(this, 15000)
+        }
+    }
+
+    /** Child phone only: every 20 s, checks whether the child has turned the app's notifications
+     *  off from system Settings (their right — this never re-enables them or blocks that choice)
+     *  and tells the parent right away through the same encrypted mailbox when they do, so the
+     *  parent finds out immediately instead of assuming the standby notification is still there.
+     *  Resends every 15 min while it stays off, in case the first alert didn't reach them. */
+    private val notifWatchTick = object : Runnable {
+        override fun run() {
+            if (mode == 2 && prefs.getBoolean("cactive", false) && curCode.isNotEmpty()) {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+                val enabled = nm.areNotificationsEnabled()
+                val now = System.currentTimeMillis()
+                if (!enabled && (notifWasEnabled || now - lastNotifAlertMs > 15 * 60 * 1000L)) {
+                    rv?.publish(CallCrypto.seal(curCode, "msg", null, "A|notif_off|${now / 1000}")) { }
+                    lastNotifAlertMs = now
+                }
+                notifWasEnabled = enabled
+                val r = rv
+                if (r != null && now - lastHbMs > 5 * 60 * 1000L) {
+                    lastHbMs = now
+                    r.publish(CallCrypto.seal(curCode, "msg", null, "A|hb|${now / 1000}|${batteryPct()}")) { }
+                }
+            }
+            if (Turn.cfNeedsRefresh(prefs) && !cfBusy && System.currentTimeMillis() - lastCfTry > 10 * 60 * 1000L) {
+                cfBusy = true; lastCfTry = System.currentTimeMillis()
+                Turn.cfRefresh(prefs) { _, _ -> cfBusy = false }
+            }
+            ui.postDelayed(this, 20000)
         }
     }
 
@@ -1309,8 +1795,17 @@ class MainActivity : Activity() {
         toast("تم النسخ")
     }
 
-    override fun onPause() { if (!svcOn) engine?.pauseCamera(); super.onPause() }
-    override fun onResume() { super.onResume(); engine?.resumeCamera() }
+    override fun onPause() {
+        if (!svcOn) engine?.pauseCamera()
+        if (this::wakeUrl.isInitialized) prefs.edit().putString("wake_url", wakeUrl.text.toString().trim()).apply()
+        stopParentWatchers()
+        super.onPause()
+    }
+    override fun onResume() {
+        super.onResume()
+        engine?.resumeCamera()
+        if (mode == 1) startParentWatchers()
+    }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
@@ -1326,6 +1821,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         stopCallService()
         ui.removeCallbacksAndMessages(null)
+        stopParentWatchers()
         rv?.stop(); rv = null
         engine?.close(); engine = null
         try { remoteView.release(); localView.release() } catch (_: Exception) {}

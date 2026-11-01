@@ -40,5 +40,15 @@ Build: push to GitHub, run the "Build APK" workflow, download artifact SecureCal
   phone, open the app once (it re-enters child mode by itself).
 - Some phone makers (Xiaomi, Huawei, Samsung...) kill background apps aggressively: use the battery exclusion and
   leave the app open on screen.
-- A TURN server (turn:host:3478,user,pass) on both phones is recommended for mobile data / strict networks.
+- A TURN server on both phones is recommended for mobile data / strict networks. No free public TURN works without an
+  account anymore (the old openrelayproject credentials are dead). One-tap setup: in the TURN card press "Metered" or
+  "Cloudflare", create a free account, copy the iceServers config (JSON or url,user,pass), then press "لصق" (paste).
+  Press "نسخ" (copy) and paste the same config on the other phone. Several servers (one per line) are supported.
 - The public ntfy.sh service only carries encrypted setup messages, never audio/video or the pairing code.
+
+## V14 additions
+- TURN card: paste (iceServers JSON or url,user,pass), Metered/Cloudflare sign-up, copy to the other phone, real relay test.
+- Cloudflare TURN auto-renewal: enter Turn Token ID + API token once; credentials (24 h) renew themselves on both phones.
+- QR pairing: parent "📷 QR" on a child card; child setup "مسح QR" fills name, pairing code and TURN. The QR contains the secret code (screenshots are blocked while it is shown).
+- Child heartbeat (every ~5 min, encrypted): parent card shows online/offline, battery, and a notification when the child phone has been silent 15+ min (while the parent app is open).
+- FCM wake-up bell (optional): see SETUP_FCM.md.
