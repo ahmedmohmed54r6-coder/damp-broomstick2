@@ -9,8 +9,8 @@ android {
         applicationId "com.securecall.app"
         minSdk 24
         targetSdk 34
-        versionCode 18
-        versionName "2.7"
+        versionCode 1
+        versionName "1.0"
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
     }
     buildTypes { release { minifyEnabled false } }
@@ -25,14 +25,6 @@ dependencies {
     implementation 'androidx.security:security-crypto:1.1.0-alpha06'
     // QR pairing (generate + scan, works without Google Play services)
     implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
-    // FCM "wake-up bell" (inactive unless app/google-services.json is present)
-    implementation platform('com.google.firebase:firebase-bom:33.5.1')
-    implementation 'com.google.firebase:firebase-messaging'
-}
-
-// Firebase is optional: the plugin is applied only when you add app/google-services.json (see SETUP_FCM.md)
-if (file('google-services.json').exists()) {
-    apply plugin: 'com.google.gms.google-services'
 }
 
 // Arabic UI font: Noto Naskh Arabic (SIL OFL 1.1), downloaded once at build time into assets/fonts/.
