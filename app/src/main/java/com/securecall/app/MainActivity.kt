@@ -515,10 +515,12 @@ class MainActivity : Activity() {
     }
 
     private fun startQrScan() {
-        try {
-            IntentIntegrator(this).setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
-                .setPrompt("وجّه الكاميرا نحو رمز QR المعروض لدى الطرف الآخر").setBeepEnabled(false).initiateScan()
-        } catch (_: Exception) { toast("تعذّر فتح الماسح") }
+        ensurePerms(listOf(Manifest.permission.CAMERA)) {
+            try {
+                IntentIntegrator(this).setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
+                    .setPrompt("وجّه الكاميرا نحو رمز QR المعروض لدى الطرف الآخر").setBeepEnabled(false).initiateScan()
+            } catch (_: Exception) { toast("تعذّر فتح الماسح") }
+        }
     }
 
     @Deprecated("Deprecated in Java")

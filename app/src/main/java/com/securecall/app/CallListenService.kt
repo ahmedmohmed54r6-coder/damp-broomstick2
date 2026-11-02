@@ -47,6 +47,7 @@ class CallListenService : Service() {
     private val seen = LinkedHashSet<String>()
     private var ringingFor = ""
     private var ringingSince = 0L
+    private var myId = ""
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -54,6 +55,7 @@ class CallListenService : Service() {
         val p = Store.prefs(this)
         val c = p.getString("pcode", "") ?: ""
         if (c.isBlank()) { stopForeground(true); stopSelf(); return START_NOT_STICKY }
+        myId = p.getString("myDeviceId", "") ?: ""
         Relay.load(p)
         goForeground()
         if (c != code || rv == null) {
@@ -107,6 +109,7 @@ class CallListenService : Service() {
         val f = hello.split("|")
         if (f.size < 4 || f[0] != "P") return
         val callerId = f[1]; val callerName = f[2]; val type = f[3]
+        if (myId.isNotBlank() && callerId == myId) return   // our own outgoing call request, echoed back
         val now = System.currentTimeMillis()
         if (ringingFor == callerId && now - ringingSince < 60_000L) return   // already ringing for this attempt
         ringingFor = callerId; ringingSince = now
