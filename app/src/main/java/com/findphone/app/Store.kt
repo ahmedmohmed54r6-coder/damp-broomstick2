@@ -1,43 +1,61 @@
 package com.findphone.app
 
 import android.content.Context
-import org.json.JSONArray
-import org.json.JSONObject
+import android.util.Base64
+import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
 
 class Store(c: Context) {
     private val p = c.getSharedPreferences("fp", Context.MODE_PRIVATE)
-    var myName: String
-        get() = p.getString("name", "") ?: ""
-        set(v) { p.edit().putString("name", v).apply() }
-    var group: String
-        get() = p.getString("group", "") ?: ""
-        set(v) { p.edit().putString("group", v).apply() }
 
+    // الكلمة السرية التي يردّ عليها الهاتف تلقائيًا
     var keyword: String
         get() = p.getString("kw", "") ?: ""
         set(v) { p.edit().putString("kw", v).apply() }
+
     fun lastPlain() = p.getLong("lastplain", 0)
     fun setLastPlain(v: Long) { p.edit().putLong("lastplain", v).apply() }
 
-    fun members(): List<Pair<String, String>> {
-        val a = JSONArray(p.getString("members", "[]"))
-        return (0 until a.length()).map { a.getJSONObject(it).let { o -> o.getString("n") to o.getString("p") } }
-    }
-    fun saveMembers(l: List<Pair<String, String>>) {
-        val a = JSONArray()
-        l.forEach { a.put(JSONObject().put("n", it.first).put("p", it.second)) }
-        p.edit().putString("members", a.toString()).apply()
-    }
-    fun memberByNumber(num: String) = members().firstOrNull { same(it.second, num) }
+    // ---------- قفل التطبيق (رمز PIN) ----------
+    val hasPin: Boolean get() = p.getString("pin_h", null) != null
 
-    fun lastTs(num: String, type: String) = p.getLong("ts_${key(num)}_$type", 0)
-    fun setLastTs(num: String, type: String, ts: Long) { p.edit().putLong("ts_${key(num)}_$type", ts).apply() }
+    fun setPin(pin: String) {
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        p.edit().putString("pin_s", Base64.encodeToString(salt, Base64.NO_WRAP))
+            .putString("pin_h", hash(pin, salt)).apply()
+    }
 
-    fun saveResult(o: JSONObject) { p.edit().putString("result", o.toString()).apply() }
-    fun result(): JSONObject? = p.getString("result", null)?.let { JSONObject(it) }
+    fun checkPin(pin: String): Boolean {
+        val h = p.getString("pin_h", null) ?: return false
+        val salt = Base64.decode(p.getString("pin_s", "") ?: "", Base64.NO_WRAP)
+        return MessageDigest.isEqual(h.toByteArray(), hash(pin, salt).toByteArray())
+    }
+
+    private fun hash(pin: String, salt: ByteArray): String {
+        val f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        val k = f.generateSecret(PBEKeySpec(pin.toCharArray(), salt, 50_000, 256)).encoded
+        return Base64.encodeToString(k, Base64.NO_WRAP)
+    }
+
+    var failCount: Int
+        get() = p.getInt("fails", 0)
+        set(v) { p.edit().putInt("fails", v).apply() }
+    var lockUntil: Long
+        get() = p.getLong("lock_until", 0)
+        set(v) { p.edit().putLong("lock_until", v).apply() }
+
+    var adminActive: Boolean
+        get() = p.getBoolean("admin", false)
+        set(v) { p.edit().putBoolean("admin", v).apply() }
+
+    // حذف بيانات النسخة القديمة (المجموعة والأعضاء)
+    fun cleanLegacy() {
+        p.edit().remove("group").remove("members").remove("result").remove("name").apply()
+    }
 
     companion object {
         fun key(n: String) = n.filter { it.isDigit() }.takeLast(8)
-        fun same(a: String, b: String) = key(a).length >= 7 && key(a) == key(b)
     }
 }
