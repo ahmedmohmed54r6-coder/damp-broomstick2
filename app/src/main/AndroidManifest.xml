@@ -12,6 +12,8 @@
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
     <application
         android:label="Find Phone"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true"

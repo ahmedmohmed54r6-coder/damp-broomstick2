@@ -2,11 +2,15 @@ package com.findphone.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.telephony.SmsManager
 import android.view.View
@@ -17,6 +21,7 @@ import java.util.Date
 class MainActivity : Activity() {
     private lateinit var s: Store
     private var resultTv: TextView? = null
+    private var statusTv: TextView? = null
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -25,7 +30,45 @@ class MainActivity : Activity() {
         build()
     }
 
-    override fun onResume() { super.onResume(); showResult() }
+    override fun onResume() { super.onResume(); showResult(); showStatus() }
+
+    // أهم روابط إعدادات التشغيل التلقائي/الخلفية المعروفة لكل شركة. قد لا تعمل على كل الإصدارات
+    // (الشركات تغيّرها باستمرار)؛ عند الفشل نفتح صفحة تفاصيل التطبيق كبديل.
+    private fun oemAutostartIntent(): Intent? {
+        val candidates = when (Build.MANUFACTURER.lowercase()) {
+            "xiaomi" -> listOf("com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity")
+            "huawei", "honor" -> listOf(
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity")
+            "oppo", "realme" -> listOf(
+                "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+                "com.coloros.safecenter" to "com.coloros.safecenter.startupapp.StartupAppListActivity")
+            "vivo" -> listOf("com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity")
+            else -> emptyList()
+        }
+        for ((pkg, cls) in candidates) {
+            val i = Intent().apply { component = ComponentName(pkg, cls); flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+            if (packageManager.queryIntentActivities(i, 0).isNotEmpty()) return i
+        }
+        return null
+    }
+
+    private fun showStatus() {
+        val problems = mutableListOf<String>()
+        if (checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED)
+            problems += "صلاحية الموقع ليست «مسموح طوال الوقت»"
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) problems += "توفير البطارية لم يُستثنَ للتطبيق"
+        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED)
+            problems += "صلاحية الرسائل غير ممنوحة"
+        if (s.keyword.isBlank()) problems += "لم تحفظ كلمة السر بعد"
+        statusTv?.apply {
+            if (problems.isEmpty()) { text = "✓ كل الإعدادات سليمة"; setTextColor(Color.parseColor("#2E7D32")) }
+            else { text = "تنبيه، أكمل هذه النقاط حتى يعمل التطبيق بثبات:\n" + problems.joinToString("\n") { "• $it" }
+                setTextColor(Color.parseColor("#C62828")) }
+        }
+    }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun tv(t: String, size: Float = 15f) = TextView(this).apply { text = t; textSize = size; setPadding(0, dp(8), 0, dp(4)) }
@@ -56,8 +99,21 @@ class MainActivity : Activity() {
         })
         root.addView(btn("إعطاء الصلاحيات") { askPerms() })
         root.addView(btn("إيقاف تحسين البطارية") {
-            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+            try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
+            catch (e: Exception) { toast("افتح إعدادات البطارية يدويًا") }
         })
+
+        val oem = oemAutostartIntent()
+        if (oem != null) root.addView(btn("فتح إعدادات «${Build.MANUFACTURER}» (تشغيل تلقائي/خلفية)") {
+            try { startActivity(oem) } catch (e: Exception) {
+                toast("تعذّر فتح الصفحة تلقائيًا، افتحها يدويًا من إعدادات التطبيقات")
+                try { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) } catch (e2: Exception) {}
+            }
+        })
+
+        statusTv = tv("")
+        root.addView(statusTv)
+        root.addView(btn("تحقّق من الإعدادات") { showStatus() })
 
         root.addView(tv("أعضاء المجموعة", 18f))
         s.members().forEach { (n, p) ->
@@ -85,6 +141,7 @@ class MainActivity : Activity() {
             }
         })
         showResult()
+        showStatus()
     }
 
     private fun showResult() {
