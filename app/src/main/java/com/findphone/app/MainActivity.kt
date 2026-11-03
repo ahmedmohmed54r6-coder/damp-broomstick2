@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -14,14 +16,18 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.telephony.SmsManager
 import android.view.View
+import android.view.ViewGroup
 import android.widget.*
+import androidx.core.content.ContextCompat
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.R as MatR
 import java.text.SimpleDateFormat
 import java.util.Date
 
 class MainActivity : Activity() {
     private lateinit var s: Store
     private var resultTv: TextView? = null
-    private var statusTv: TextView? = null
+    private var statusBox: LinearLayout? = null
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -31,6 +37,213 @@ class MainActivity : Activity() {
     }
 
     override fun onResume() { super.onResume(); showResult(); showStatus() }
+
+    // ---------- أدوات مساعدة للقياسات والألوان ----------
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun col(id: Int) = ContextCompat.getColor(this, id)
+
+    private fun sectionTitle(t: String) = TextView(this).apply {
+        text = t; textSize = 13f; setTypeface(typeface, Typeface.BOLD)
+        setTextColor(col(R.color.text_sub))
+        setPadding(dp(4), 0, dp(4), dp(10))
+        letterSpacing = 0.02f
+    }
+
+    private fun label(t: String) = TextView(this).apply {
+        text = t; textSize = 13.5f; setTextColor(col(R.color.text_sub))
+        setPadding(dp(2), dp(4), dp(2), dp(6))
+    }
+
+    private fun card(vararg children: View): LinearLayout {
+        val c = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_card)
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(16) }
+        }
+        children.forEach { c.addView(it) }
+        return c
+    }
+
+    private fun et(h: String, v: String = "", phone: Boolean = false) = EditText(this).apply {
+        hint = h; setText(v); textSize = 15f
+        setTextColor(col(R.color.text_main)); setHintTextColor(col(R.color.text_sub))
+        background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_input)
+        if (phone) inputType = android.text.InputType.TYPE_CLASS_PHONE
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(6); bottomMargin = dp(6) }
+    }
+
+    // زر معبّأ (إجراء رئيسي) أو محدَّد الإطار (إجراء ثانوي)
+    private fun mbtn(t: String, filled: Boolean = true, full: Boolean = true, f: () -> Unit): MaterialButton {
+        val style = if (filled) MatR.attr.materialButtonStyle else MatR.attr.materialButtonOutlinedStyle
+        return MaterialButton(this, null, style).apply {
+            text = t; textSize = 14f; isAllCaps = false
+            cornerRadius = dp(14)
+            insetTop = 0; insetBottom = 0
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            if (filled) {
+                backgroundTintList = android.content.res.ColorStateList.valueOf(col(R.color.primary))
+                setTextColor(col(R.color.on_primary))
+            } else {
+                strokeColor = android.content.res.ColorStateList.valueOf(col(R.color.stroke))
+                strokeWidth = dp(1)
+                setTextColor(col(R.color.primary))
+            }
+            if (full) layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(6) }
+            setOnClickListener { f() }
+        }
+    }
+
+    private fun iconBtn(t: String, bg: Int, f: () -> Unit) = MaterialButton(this, null, MatR.attr.materialButtonStyle).apply {
+        text = t; textSize = 13f; isAllCaps = false; cornerRadius = dp(12)
+        insetTop = 0; insetBottom = 0
+        setPadding(dp(14), dp(8), dp(14), dp(8))
+        backgroundTintList = android.content.res.ColorStateList.valueOf(col(bg))
+        setTextColor(Color.WHITE)
+        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(8) }
+        setOnClickListener { f() }
+    }
+
+    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
+
+    // ---------- شريط الترويسة ----------
+    private fun header(): View {
+        val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                intArrayOf(col(R.color.accent), col(R.color.primary_dark))).apply { cornerRadius = dp(22).toFloat() }
+            setPadding(dp(20), dp(24), dp(20), dp(24))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(18) }
+        }
+        wrap.addView(TextView(this).apply {
+            text = "Find Phone"; textSize = 22f; setTypeface(typeface, Typeface.BOLD); setTextColor(Color.WHITE)
+        })
+        wrap.addView(TextView(this).apply {
+            text = "تحديد موقع هاتفك عبر رسالة نصية عند الضياع"
+            textSize = 13.5f; setTextColor(Color.parseColor("#D8E6FF")); setPadding(0, dp(4), 0, 0)
+        })
+        return wrap
+    }
+
+    private fun build() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(20), dp(16), dp(28))
+            setBackgroundColor(col(R.color.bg))
+        }
+        setContentView(ScrollView(this).apply {
+            setBackgroundColor(col(R.color.bg))
+            isFillViewport = true
+            addView(root)
+        })
+
+        root.addView(header())
+
+        // --- الإعداد الأساسي ---
+        val name = et("اسمك", s.myName); val group = et("كود المجموعة (سري)", s.group)
+        root.addView(card(
+            sectionTitle("الإعداد الأساسي"),
+            label("اسمك"), name,
+            label("كود المجموعة (سري، 6 أحرف فأكثر)"), group,
+            mbtn("حفظ") {
+                if (group.text.length < 6) toast("اجعل الكود 6 أحرف على الأقل")
+                else { s.myName = name.text.toString().trim(); s.group = group.text.toString(); toast("تم الحفظ") }
+            }
+        ))
+
+        // --- الرد التلقائي بالرمز ---
+        val kw = et("مثال: 123456789", s.keyword)
+        root.addView(card(
+            sectionTitle("الرد التلقائي بكلمة السر"),
+            label("يرد تلقائيًا على أي رسالة تحمل هذه الكلمة، من أي هاتف"),
+            kw,
+            mbtn("حفظ الكلمة") {
+                val k = kw.text.toString().trim()
+                if (k.isNotEmpty() && k.length < 6) toast("الكلمة 6 أحرف فأكثر")
+                else { s.keyword = k; toast(if (k.isEmpty()) "أُلغي الرد التلقائي" else "تم الحفظ") }
+            }
+        ))
+
+        // --- الصلاحيات والاستقرار ---
+        val permsChildren = mutableListOf<View>(
+            sectionTitle("الصلاحيات والاستقرار"),
+            mbtn("إعطاء الصلاحيات", filled = false) { askPerms() },
+            mbtn("إيقاف تحسين البطارية", filled = false) {
+                try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
+                catch (e: Exception) { toast("افتح إعدادات البطارية يدويًا") }
+            }
+        )
+        val oem = oemAutostartIntent()
+        if (oem != null) permsChildren += mbtn("إعدادات «${Build.MANUFACTURER}» (تشغيل تلقائي)", filled = false) {
+            try { startActivity(oem) } catch (e: Exception) {
+                toast("تعذّر فتح الصفحة تلقائيًا، افتحها يدويًا من إعدادات التطبيقات")
+                try { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) } catch (e2: Exception) {}
+            }
+        }
+        statusBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(10) }
+        }
+        permsChildren += statusBox!!
+        permsChildren += mbtn("تحقّق من الإعدادات", filled = false) { showStatus() }
+        root.addView(card(*permsChildren.toTypedArray()))
+
+        // --- أعضاء المجموعة ---
+        val memberChildren = mutableListOf<View>(sectionTitle("أعضاء المجموعة"))
+        val members = s.members()
+        if (members.isEmpty()) memberChildren += label("لا يوجد أعضاء بعد")
+        members.forEach { (n, p) ->
+            val rowCard = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = GradientDrawable().apply { setColor(col(R.color.bg)); cornerRadius = dp(14).toFloat() }
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { topMargin = dp(8) }
+            }
+            rowCard.addView(TextView(this).apply {
+                text = n; textSize = 15f; setTypeface(typeface, Typeface.BOLD); setTextColor(col(R.color.text_main))
+            })
+            rowCard.addView(TextView(this).apply {
+                text = p; textSize = 13f; setTextColor(col(R.color.text_sub)); setPadding(0, 0, 0, dp(8))
+            })
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            row.addView(iconBtn("الموقع", R.color.primary) { send(p, "L") })
+            row.addView(iconBtn("رنين", R.color.accent) { send(p, "B") })
+            row.addView(iconBtn("حذف", R.color.danger) { s.saveMembers(s.members().filter { it.second != p }); build() })
+            rowCard.addView(row)
+            memberChildren += rowCard
+        }
+        val mn = et("اسم العضو"); val mp = et("رقم هاتفه", phone = true)
+        memberChildren += label("إضافة عضو جديد")
+        memberChildren += mn; memberChildren += mp
+        memberChildren += mbtn("إضافة عضو") {
+            val n = mn.text.toString().trim(); val p = mp.text.toString().trim()
+            if (n.isEmpty() || Store.key(p).length < 7) toast("أدخل اسماً ورقماً صحيحاً")
+            else { s.saveMembers(s.members() + (n to p)); build() }
+        }
+        root.addView(card(*memberChildren.toTypedArray()))
+
+        // --- آخر نتيجة ---
+        resultTv = TextView(this).apply { textSize = 14f; setTextColor(col(R.color.text_main)) }
+        root.addView(card(
+            sectionTitle("آخر نتيجة"),
+            resultTv!!,
+            mbtn("فتح الخريطة") {
+                s.result()?.let {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${it.getString("lat")},${it.getString("lon")}(${Uri.encode(it.getString("name"))})")))
+                }
+            }
+        ))
+
+        showResult()
+        showStatus()
+    }
 
     // أهم روابط إعدادات التشغيل التلقائي/الخلفية المعروفة لكل شركة. قد لا تعمل على كل الإصدارات
     // (الشركات تغيّرها باستمرار)؛ عند الفشل نفتح صفحة تفاصيل التطبيق كبديل.
@@ -54,6 +267,7 @@ class MainActivity : Activity() {
     }
 
     private fun showStatus() {
+        val box = statusBox ?: return
         val problems = mutableListOf<String>()
         if (checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED)
             problems += "صلاحية الموقع ليست «مسموح طوال الوقت»"
@@ -63,85 +277,20 @@ class MainActivity : Activity() {
             checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED)
             problems += "صلاحية الرسائل غير ممنوحة"
         if (s.keyword.isBlank()) problems += "لم تحفظ كلمة السر بعد"
-        statusTv?.apply {
-            if (problems.isEmpty()) { text = "✓ كل الإعدادات سليمة"; setTextColor(Color.parseColor("#2E7D32")) }
-            else { text = "تنبيه، أكمل هذه النقاط حتى يعمل التطبيق بثبات:\n" + problems.joinToString("\n") { "• $it" }
-                setTextColor(Color.parseColor("#C62828")) }
-        }
-    }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-    private fun tv(t: String, size: Float = 15f) = TextView(this).apply { text = t; textSize = size; setPadding(0, dp(8), 0, dp(4)) }
-    private fun et(h: String, v: String = "", phone: Boolean = false) = EditText(this).apply {
-        hint = h; setText(v); if (phone) inputType = android.text.InputType.TYPE_CLASS_PHONE
-    }
-    private fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
-    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
-
-    private fun build() {
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(24), dp(16), dp(24)) }
-        setContentView(ScrollView(this).apply { addView(root) })
-        root.addView(tv("العثور على الهاتف (SMS)", 22f))
-
-        val name = et("اسمك", s.myName); val group = et("كود المجموعة (سري)", s.group)
-        root.addView(name); root.addView(group)
-        root.addView(btn("حفظ") {
-            if (group.text.length < 6) toast("اجعل الكود 6 أحرف على الأقل")
-            else { s.myName = name.text.toString().trim(); s.group = group.text.toString(); toast("تم الحفظ") }
-        })
-        root.addView(tv("كلمة السر للرد التلقائي (يرد على أي رقم يرسلها، حتى من هاتف بلا التطبيق)"))
-        val kw = et("مثال: 123456789", s.keyword)
-        root.addView(kw)
-        root.addView(btn("حفظ الكلمة") {
-            val k = kw.text.toString().trim()
-            if (k.isNotEmpty() && k.length < 6) toast("الكلمة 6 أحرف فأكثر")
-            else { s.keyword = k; toast(if (k.isEmpty()) "أُلغي الرد التلقائي" else "تم الحفظ") }
-        })
-        root.addView(btn("إعطاء الصلاحيات") { askPerms() })
-        root.addView(btn("إيقاف تحسين البطارية") {
-            try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
-            catch (e: Exception) { toast("افتح إعدادات البطارية يدويًا") }
-        })
-
-        val oem = oemAutostartIntent()
-        if (oem != null) root.addView(btn("فتح إعدادات «${Build.MANUFACTURER}» (تشغيل تلقائي/خلفية)") {
-            try { startActivity(oem) } catch (e: Exception) {
-                toast("تعذّر فتح الصفحة تلقائيًا، افتحها يدويًا من إعدادات التطبيقات")
-                try { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) } catch (e2: Exception) {}
+        box.removeAllViews()
+        box.background = ContextCompat.getDrawable(this, if (problems.isEmpty()) R.drawable.bg_status_ok else R.drawable.bg_status_warn)
+        if (problems.isEmpty()) {
+            box.addView(TextView(this).apply { text = "✓ كل الإعدادات سليمة"; setTextColor(col(R.color.ok)); setTypeface(typeface, Typeface.BOLD) })
+        } else {
+            box.addView(TextView(this).apply {
+                text = "أكمل هذه النقاط حتى يعمل التطبيق بثبات:"
+                setTextColor(col(R.color.warn)); setTypeface(typeface, Typeface.BOLD); setPadding(0, 0, 0, dp(4))
+            })
+            problems.forEach { p ->
+                box.addView(TextView(this).apply { text = "•  $p"; setTextColor(col(R.color.warn)); textSize = 13f })
             }
-        })
-
-        statusTv = tv("")
-        root.addView(statusTv)
-        root.addView(btn("تحقّق من الإعدادات") { showStatus() })
-
-        root.addView(tv("أعضاء المجموعة", 18f))
-        s.members().forEach { (n, p) ->
-            root.addView(tv("$n  —  $p"))
-            val row = LinearLayout(this)
-            row.addView(btn("تحديد الموقع") { send(p, "L") })
-            row.addView(btn("رنين") { send(p, "B") })
-            row.addView(btn("حذف") { s.saveMembers(s.members().filter { it.second != p }); build() })
-            root.addView(row)
         }
-        val mn = et("اسم العضو"); val mp = et("رقم هاتفه", phone = true)
-        root.addView(mn); root.addView(mp)
-        root.addView(btn("إضافة عضو") {
-            val n = mn.text.toString().trim(); val p = mp.text.toString().trim()
-            if (n.isEmpty() || Store.key(p).length < 7) toast("أدخل اسماً ورقماً صحيحاً")
-            else { s.saveMembers(s.members() + (n to p)); build() }
-        })
-
-        root.addView(tv("آخر نتيجة", 18f))
-        resultTv = tv("")
-        root.addView(resultTv)
-        root.addView(btn("فتح الخريطة") {
-            s.result()?.let {
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${it.getString("lat")},${it.getString("lon")}(${Uri.encode(it.getString("name"))})")))
-            }
-        })
-        showResult()
-        showStatus()
     }
 
     private fun showResult() {
@@ -175,5 +324,6 @@ class MainActivity : Activity() {
             toast("الآن اختر «السماح طوال الوقت» للموقع")
             requestPermissions(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 2)
         }
+        showStatus()
     }
 }
