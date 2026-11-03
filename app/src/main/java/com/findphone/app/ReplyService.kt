@@ -21,13 +21,15 @@ import android.os.PowerManager
 class ReplyService : Service() {
     private val h = Handler(Looper.getMainLooper())
     private var best: Location? = null
-    private var located = false
     private var started = false
     private var anyProvider = false
+    private var sentOnce = false   // أول رسالة: تُرسل بسرعة بأفضل ما هو متاح، حتى لو غير دقيق
+    private var sentUpdate = false // تحديث واحد فقط إن تحسّن الموقع لاحقًا
     private var player: MediaPlayer? = null
     private var lm: LocationManager? = null
     private var wl: PowerManager.WakeLock? = null
     private var job: SmsJob? = null
+    private var updateJob: SmsJob? = null
 
     private var to = ""
     private var ring = false
@@ -38,8 +40,10 @@ class ReplyService : Service() {
         override fun onLocationChanged(l: Location) {
             val acc = if (l.hasAccuracy()) l.accuracy else 9999f
             val b = best
-            if (b == null || acc < (if (b.hasAccuracy()) b.accuracy else 9999f)) best = l
-            if (acc <= 30f) finish()
+            val bAcc = if (b != null && b.hasAccuracy()) b.accuracy else Float.MAX_VALUE
+            if (b == null || acc < bAcc) best = l
+            if (!sentOnce && acc <= 30f) sendNow(false)
+            else if (sentOnce && !sentUpdate && acc <= 30f && (b == null || acc < bAcc - 20f)) sendUpdate(l)
         }
         override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
         override fun onProviderEnabled(p: String) {}
@@ -52,7 +56,6 @@ class ReplyService : Service() {
         if (i == null) { stopSelf(); return START_NOT_STICKY }
         val nm = getSystemService(NotificationManager::class.java)
         // اسم القناة ونصها عامّان ومنخفضا الأولوية عمدًا حتى لا يلفتا نظر من بحوزته الهاتف.
-        // هذا لا يُخفي الإشعار (أندرويد لا يسمح بذلك لخدمة موقع تعمل في الخلفية)، لكنه يجعله غير لافت.
         // الخدمة تواصل العمل حتى لو عطّل المستخدم إشعارات التطبيق من الإعدادات.
         val ch = NotificationChannel("svc", "خدمات النظام", NotificationManager.IMPORTANCE_MIN)
         ch.setShowBadge(false)
@@ -67,7 +70,7 @@ class ReplyService : Service() {
 
         // يبقي المعالج مستيقظًا أثناء انتظار GPS (مهم عند الشاشة المقفلة وبدون إنترنت)
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "findphone:reply").apply { acquire(12 * 60_000L) }
+        wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "findphone:reply").apply { acquire(5 * 60_000L) }
 
         if (ring) startRing()
 
@@ -79,17 +82,17 @@ class ReplyService : Service() {
                 if (mgr.isProviderEnabled(pr)) { mgr.requestLocationUpdates(pr, 0L, 0f, listener, Looper.getMainLooper()); anyProvider = true }
         } catch (e: SecurityException) { }
 
-        // GPS البارد بدون إنترنت قد يحتاج دقيقة أو أكثر: ننتظر حتى دقيقتين ونقبل نتيجة أقل دقة مع الوقت
-        h.postDelayed({ accept(100f) }, 20_000L)
-        h.postDelayed({ accept(300f) }, 45_000L)
-        h.postDelayed({ accept(Float.MAX_VALUE) }, 90_000L)
-        h.postDelayed({ finish() }, 120_000L)
+        // لا ننتظر دقيقتين قبل أول رد: نرسل بسرعة بأفضل موقع متاح (حتى لو قديم)،
+        // ثم نرسل تحديثًا واحدًا فقط إن وصل موقع أدق خلال الدقيقة التالية.
+        h.postDelayed({ if (!sentOnce) sendNow(true) }, 7_000L)
+        h.postDelayed({ stopIfIdle() }, 65_000L)
         return START_NOT_STICKY
     }
 
-    private fun accept(maxAcc: Float) {
-        val b = best ?: return
-        if ((if (b.hasAccuracy()) b.accuracy else 9999f) <= maxAcc) finish()
+    private fun stopIfIdle() {
+        try { lm?.removeUpdates(listener) } catch (e: Exception) { }
+        if (job == null && updateJob == null) stopSelf()
+        else h.postDelayed({ stopSelf() }, 10_000L)
     }
 
     private fun baseNotif(text: String) =
@@ -106,22 +109,14 @@ class ReplyService : Service() {
         try { getSystemService(NotificationManager::class.java).notify(1, baseNotif("مزامنة")) } catch (e: Exception) { }
     }
 
-    private fun finish() {
-        if (located) return
-        located = true
-        try { lm?.removeUpdates(listener) } catch (e: Exception) { }
-        var l = best
-        var stale = false
-        if (l == null) {
-            val mgr = lm
-            l = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
-                .mapNotNull { runCatching { mgr?.getLastKnownLocation(it) }.getOrNull() }
-                .maxByOrNull { it.time }
-            stale = l != null
-        }
-        val bat = (getSystemService(Context.BATTERY_SERVICE) as BatteryManager)
-            .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+    private fun lastKnown(): Location? {
+        val mgr = lm ?: return null
+        return listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+            .mapNotNull { runCatching { mgr.getLastKnownLocation(it) }.getOrNull() }
+            .maxByOrNull { it.time }
+    }
 
+    private fun format(l: Location?, stale: Boolean, bat: Int): String {
         val sb = StringBuilder("FindPhone: ")
         if (l != null) {
             sb.append("https://maps.google.com/?q=%.6f,%.6f".format(java.util.Locale.US, l.latitude, l.longitude))
@@ -130,15 +125,40 @@ class ReplyService : Service() {
             if (stale && l.time > 0 && ageMin >= 1) sb.append(" old ${ageMin}m")
             sb.append(" bat $bat%")
         } else {
-            sb.append(if (anyProvider) "no GPS fix" else "location is OFF").append(", bat $bat%")
+            sb.append(if (anyProvider) "no GPS fix yet" else "location is OFF").append(", bat $bat%")
         }
+        return sb.toString()
+    }
 
-        job = SmsJob(this, to, sb.toString(), sub,
+    private fun battery() = (getSystemService(Context.BATTERY_SERVICE) as BatteryManager)
+        .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+    // أول إرسال: فورًا بأفضل ما هو متاح، لا ننتظر دقة عالية
+    private fun sendNow(useFallback: Boolean) {
+        if (sentOnce) return
+        sentOnce = true
+        var l = best
+        var stale = false
+        if (l == null && useFallback) { l = lastKnown(); stale = l != null }
+        val text = format(l, stale, battery())
+        job = SmsJob(this, to, text, sub,
             onStatus = { updateNotification(it) },
             onFinished = { ok ->
                 if (!ok) updateNotification("تعذّر الإرسال (لا تغطية)")
-                h.postDelayed({ stopSelf() }, if (ring) 60_000L else 3_000L)
+                job = null
+                h.postDelayed({ stopIfIdle() }, if (ring) 55_000L else 2_000L)
             }).also { it.start() }
+    }
+
+    // تحديث واحد فقط إن تحسّن الموقع كثيرًا بعد الإرسال الأول
+    private fun sendUpdate(l: Location) {
+        if (sentUpdate) return
+        sentUpdate = true
+        val text = "Update " + format(l, false, battery())
+        updateJob = SmsJob(this, to, text, sub,
+            backoffsMs = longArrayOf(5_000, 15_000),
+            onFinished = { updateJob = null })
+            .also { it.start() }
     }
 
     private fun startRing() {
@@ -157,6 +177,7 @@ class ReplyService : Service() {
     override fun onDestroy() {
         h.removeCallbacksAndMessages(null)
         job?.cancel()
+        updateJob?.cancel()
         try { lm?.removeUpdates(listener) } catch (e: Exception) { }
         try { player?.stop(); player?.release() } catch (e: Exception) { }
         try { if (wl?.isHeld == true) wl?.release() } catch (e: Exception) { }
