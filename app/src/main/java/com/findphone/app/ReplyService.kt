@@ -35,15 +35,25 @@ class ReplyService : Service() {
     private var ring = false
     private var sub = -1
 
+    // "مزوّد الشبكة" (أبراج/واي فاي) قد يخطئ بعشرات الكيلومترات في مناطق ضعيفة التغطية، رغم
+    // أنه يعلن دقة صغيرة. GPS (الأقمار) هو الموثوق فعلًا ولا يحتاج إنترنت، فنفضّله دائمًا تقريبًا
+    // بإضافة "عقوبة" وهمية على نتائج الشبكة بدل الثقة برقم الدقة المعلن وحده.
+    private fun weight(l: Location): Float {
+        val acc = if (l.hasAccuracy()) l.accuracy else 9999f
+        val penalty = if (l.provider != LocationManager.GPS_PROVIDER) 3000f else 0f
+        return acc + penalty
+    }
+
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     private val listener = object : LocationListener {
         override fun onLocationChanged(l: Location) {
-            val acc = if (l.hasAccuracy()) l.accuracy else 9999f
+            val w = weight(l)
             val b = best
-            val bAcc = if (b != null && b.hasAccuracy()) b.accuracy else Float.MAX_VALUE
-            if (b == null || acc < bAcc) best = l
-            if (!sentOnce && acc <= 30f) sendNow(false)
-            else if (sentOnce && !sentUpdate && acc <= 30f && (b == null || acc < bAcc - 20f)) sendUpdate(l)
+            val bw = if (b != null) weight(b) else Float.MAX_VALUE
+            if (b == null || w < bw) best = l
+            val isGpsGood = l.provider == LocationManager.GPS_PROVIDER && l.hasAccuracy() && l.accuracy <= 30f
+            if (!sentOnce && isGpsGood) sendNow(false)
+            else if (sentOnce && !sentUpdate && isGpsGood && (b == null || w < bw - 20f)) sendUpdate(l)
         }
         override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
         override fun onProviderEnabled(p: String) {}
@@ -109,11 +119,14 @@ class ReplyService : Service() {
         try { getSystemService(NotificationManager::class.java).notify(1, baseNotif("مزامنة")) } catch (e: Exception) { }
     }
 
+    // آخر موقع معروف: نفضّل GPS دائمًا مهما كان عمره على "الشبكة" الأحدث، لأن خطأ الشبكة قد
+    // يبلغ عشرات الكيلومترات بينما GPS القديم غالبًا ما زال قريبًا من الموقع الفعلي.
     private fun lastKnown(): Location? {
         val mgr = lm ?: return null
-        return listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+        val all = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
             .mapNotNull { runCatching { mgr.getLastKnownLocation(it) }.getOrNull() }
-            .maxByOrNull { it.time }
+        return all.filter { it.provider == LocationManager.GPS_PROVIDER }.maxByOrNull { it.time }
+            ?: all.maxByOrNull { it.time }
     }
 
     private fun format(l: Location?, stale: Boolean, bat: Int): String {
@@ -123,6 +136,8 @@ class ReplyService : Service() {
             if (l.hasAccuracy()) sb.append(" acc ${l.accuracy.toInt()}m")
             val ageMin = (System.currentTimeMillis() - l.time) / 60_000
             if (stale && l.time > 0 && ageMin >= 1) sb.append(" old ${ageMin}m")
+            // تنبيه صريح عندما يكون المصدر "الشبكة" وليس GPS، لأنه الأقل موثوقية
+            if (l.provider != LocationManager.GPS_PROVIDER) sb.append(" [network, may be off by km]")
             sb.append(" bat $bat%")
         } else {
             sb.append(if (anyProvider) "no GPS fix yet" else "location is OFF").append(", bat $bat%")
