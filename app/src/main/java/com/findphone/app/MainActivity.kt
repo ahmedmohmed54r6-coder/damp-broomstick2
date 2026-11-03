@@ -269,8 +269,12 @@ class MainActivity : Activity() {
     private fun showStatus() {
         val box = statusBox ?: return
         val problems = mutableListOf<String>()
-        if (checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED)
+        // قبل أندرويد 10 لا توجد خاصية "طوال الوقت" أصلاً؛ صلاحية الموقع العادية تكفي للخلفية تلقائيًا
+        if (Build.VERSION.SDK_INT >= 29 &&
+            checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED)
             problems += "صلاحية الموقع ليست «مسموح طوال الوقت»"
+        else if (Build.VERSION.SDK_INT < 29 && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED)
+            problems += "صلاحية الموقع غير ممنوحة"
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (!pm.isIgnoringBatteryOptimizations(packageName)) problems += "توفير البطارية لم يُستثنَ للتطبيق"
         if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED ||
@@ -319,7 +323,8 @@ class MainActivity : Activity() {
     }
 
     override fun onRequestPermissionsResult(rc: Int, perms: Array<out String>, res: IntArray) {
-        if (rc == 1 && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
+        if (rc == 1 && Build.VERSION.SDK_INT >= 29 &&
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
             checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             toast("الآن اختر «السماح طوال الوقت» للموقع")
             requestPermissions(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 2)
