@@ -1,16 +1,4 @@
-# SecureCall
-
-Encrypted two-person video/voice call app for Android. Both sides are equal: whoever calls, the
-other side gets a normal ringing incoming-call screen (Accept/Decline) — nothing answers itself,
-nothing tracks location, nothing hides its own notification.
-
-## Pairing
-One device: "إنشاء رمز اقتران جديد" → shows a QR code + text code.
-Other device: "مسح رمز QR" (or paste the text code) → both devices now share the same secret code.
-
-## Calling
-From the home screen: "اتصال فيديو" or "اتصال صوتي". The other side rings and chooses to accept
-or decline. In-call text chat is available via the 💬 button.
-
-## TURN / relay servers
-Optional but recommended for calls across mobile data — see the in-app settings cards.
+# Find Phone (SMS)
+Group phone finder over encrypted SMS, no server, no internet.
+Setup on every phone: name + same group code, grant permissions (location "all the time"), disable battery optimization, add the other members' names + numbers.
+Locate/Ring sends an AES-GCM SMS; the lost phone replies with its location as an encrypted SMS and a notification opens the map.
