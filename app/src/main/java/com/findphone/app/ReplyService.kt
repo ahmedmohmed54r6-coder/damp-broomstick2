@@ -209,6 +209,9 @@ class ReplyService : Service() {
                 else { l = null; stale = false }   // لا شيء موثوق إطلاقًا: الصدق أفضل من رقم مضلِّل
             }
         }
+        val up = l
+        if (up != null) CloudSync.uploadLocation(up.latitude, up.longitude, if (up.hasAccuracy()) up.accuracy else -1f,
+            up.time, battery(), up.provider ?: "", stale)
         var text = format(l, stale, battery())
         if (lockReq) text += if (lockDone) " [locked]" else " [lock failed: enable device-admin protection]"
         job = SmsJob(this, to, text, sub,
@@ -224,6 +227,8 @@ class ReplyService : Service() {
     private fun sendUpdate(l: Location) {
         if (sentUpdate) return
         sentUpdate = true
+        CloudSync.uploadLocation(l.latitude, l.longitude, if (l.hasAccuracy()) l.accuracy else -1f,
+            l.time, battery(), l.provider ?: "", false)
         val text = "Update " + format(l, false, battery())
         updateJob = SmsJob(this, to, text, sub,
             backoffsMs = longArrayOf(5_000, 15_000),

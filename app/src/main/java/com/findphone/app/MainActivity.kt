@@ -27,7 +27,10 @@ import android.widget.*
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.DocumentReference
+import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.SetOptions
 import com.google.android.material.R as MatR
 
@@ -67,7 +70,7 @@ class MainActivity : Activity() {
 
     override fun onStop() { super.onStop(); stoppedAt = System.currentTimeMillis() }
 
-    override fun onDestroy() { sendJob?.cancel(); super.onDestroy() }
+    override fun onDestroy() { sendJob?.cancel(); pairReg?.remove(); super.onDestroy() }
 
     // ---------- أدوات مساعدة ----------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -261,13 +264,15 @@ class MainActivity : Activity() {
         }
         root.addView(card(
             sectionTitle("الحساب السحابي — بدون بريد إلكتروني"),
-            label("يسجّل هذا الهاتف بحساب مجهول آمن من Firebase. لا تحتاج إلى بريد أو كلمة مرور. بعد ذلك يمكن إضافة نظام الاقتران بالكود."),
+            label("يسجّل هذا الهاتف بحساب مجهول آمن من Firebase. لا تحتاج إلى بريد أو كلمة مرور. ثم استخدم البطاقتين التاليتين للاقتران بهاتف آخر ومشاهدة الموقع."),
             cloudStatus,
             mbtn("تفعيل الاتصال السحابي") { activateCloud(cloudStatus) }
         ))
         FirebaseAuth.getInstance().currentUser?.let {
             cloudStatus.text = "هذا الهاتف مسجل سحابيًا."
         }
+        root.addView(ownerCard())
+        root.addView(viewerCard())
 
         val kw = et("مثال: 123456789", s.keyword)
         root.addView(card(
@@ -320,6 +325,248 @@ class MainActivity : Activity() {
             unlocked = false; current = "lock"; renderLock()
         })
         showStatus()
+    }
+
+    // ---------- الاقتران وعرض الموقع عبر السحابة ----------
+    private var pairReg: ListenerRegistration? = null
+
+    private fun withUid(onUid: (String) -> Unit, onFail: (String) -> Unit) {
+        val auth = FirebaseAuth.getInstance()
+        val u = auth.currentUser
+        if (u != null) { onUid(u.uid); return }
+        auth.signInAnonymously()
+            .addOnSuccessListener { r -> onUid(r.user!!.uid) }
+            .addOnFailureListener { e -> onFail(e.localizedMessage ?: "error") }
+    }
+
+    private fun deviceLabel() = "${Build.MANUFACTURER} ${Build.MODEL}"
+
+    private fun newCode(): String {
+        val a = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        val r = java.security.SecureRandom()
+        return (1..8).map { a[r.nextInt(a.length)] }.joinToString("")
+    }
+
+    private fun ago(ms: Long): String {
+        val m = (System.currentTimeMillis() - ms) / 60_000
+        return when {
+            ms <= 0 -> "غير معروف"
+            m < 1 -> "الآن"
+            m < 60 -> "$m د"
+            m < 1440 -> "${m / 60} س"
+            else -> "${m / 1440} يوم"
+        }
+    }
+
+    // بطاقة «هذا الهاتف»: أنشئ كودًا ليقترن به هاتف آخر، وارفع الموقع، وأدِر المصرّح لهم
+    private fun ownerCard(): View {
+        val codeTv = TextView(this).apply {
+            textSize = 26f
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+            setTextColor(col(R.color.text_main))
+            gravity = android.view.Gravity.CENTER
+            textDirection = View.TEXT_DIRECTION_LTR
+            setPadding(0, dp(10), 0, dp(10))
+        }
+        val note = TextView(this).apply {
+            textSize = 13f; setTextColor(col(R.color.text_sub)); setPadding(dp(2), dp(2), dp(2), dp(6))
+        }
+        return card(
+            sectionTitle("السماح لهاتف آخر بمشاهدة موقع هذا الهاتف"),
+            label("أنشئ كودًا هنا (وهذا الهاتف بيدك)، ثم أدخله في الهاتف الآخر. ستظهر لك رسالة لتوافق قبل أي مشاهدة، ويمكنك إلغاء التصريح لاحقًا."),
+            codeTv, note,
+            mbtn("إنشاء كود اقتران") {
+                codeTv.text = "..."
+                withUid({ uid ->
+                    val code = newCode()
+                    val data = hashMapOf<String, Any?>(
+                        "ownerUid" to uid,
+                        "ownerName" to deviceLabel(),
+                        "expiresAt" to com.google.firebase.Timestamp(java.util.Date(System.currentTimeMillis() + 10 * 60_000L)),
+                        "claimedBy" to null
+                    )
+                    val ref = FirebaseFirestore.getInstance().collection("pairings").document(code)
+                    ref.set(data)
+                        .addOnSuccessListener {
+                            codeTv.text = code.substring(0, 4) + "-" + code.substring(4)
+                            note.text = "صالح 10 دقائق. أدخله في الهاتف الثاني ثم وافق هنا."
+                            pairReg?.remove()
+                            pairReg = ref.addSnapshotListener { snap, _ ->
+                                if (snap == null || !snap.exists()) return@addSnapshotListener
+                                val by = snap.getString("claimedBy") ?: return@addSnapshotListener
+                                val name = snap.getString("claimerName") ?: "هاتف"
+                                pairReg?.remove(); pairReg = null
+                                askApprove(ref, uid, by, name)
+                            }
+                        }
+                        .addOnFailureListener { e ->
+                            codeTv.text = ""
+                            toast("تعذّر إنشاء الكود: ${e.localizedMessage}")
+                        }
+                }, { toast("تعذّر الاتصال: $it") })
+            },
+            mbtn("رفع آخر موقع الآن", filled = false) { uploadNow(note) },
+            mbtn("الهواتف المصرّح لها (إلغاء)", filled = false) { showViewers() }
+        )
+    }
+
+    private fun askApprove(ref: DocumentReference, ownerUid: String, viewerUid: String, name: String) {
+        if (isFinishing || isDestroyed) return
+        AlertDialog.Builder(this)
+            .setTitle("طلب اقتران")
+            .setMessage("الهاتف «$name» يطلب مشاهدة موقع هذا الهاتف. هل توافق؟")
+            .setCancelable(false)
+            .setPositiveButton("موافقة") { _, _ ->
+                val v = hashMapOf<String, Any>("name" to name, "since" to FieldValue.serverTimestamp())
+                FirebaseFirestore.getInstance().collection("devices").document(ownerUid)
+                    .collection("viewers").document(viewerUid).set(v)
+                    .addOnSuccessListener { toast("تمت الموافقة"); ref.delete() }
+                    .addOnFailureListener { e -> toast("تعذّرت الموافقة: ${e.localizedMessage}") }
+            }
+            .setNegativeButton("رفض") { _, _ -> ref.delete(); toast("تم الرفض") }
+            .show()
+    }
+
+    private fun showViewers() {
+        withUid({ uid ->
+            val vcol = FirebaseFirestore.getInstance().collection("devices").document(uid).collection("viewers")
+            vcol.get()
+                .addOnSuccessListener { qs ->
+                    if (qs.isEmpty) { toast("لا توجد هواتف مصرّح لها"); return@addOnSuccessListener }
+                    val ids = qs.documents.map { it.id }
+                    val names = qs.documents.map { it.getString("name") ?: it.id.take(6) }
+                    AlertDialog.Builder(this)
+                        .setTitle("اضغط على هاتف لإلغاء تصريحه")
+                        .setItems(names.toTypedArray()) { _, i ->
+                            vcol.document(ids[i]).delete()
+                                .addOnSuccessListener { toast("تم إلغاء التصريح") }
+                                .addOnFailureListener { e -> toast("تعذّر الإلغاء: ${e.localizedMessage}") }
+                        }
+                        .setNegativeButton("إغلاق", null)
+                        .show()
+                }
+                .addOnFailureListener { e -> toast("تعذّر التحميل: ${e.localizedMessage}") }
+        }, { toast("تعذّر الاتصال: $it") })
+    }
+
+    // يرفع آخر موقع معروف (يُستخدم أيضًا تلقائيًا عند الرد على الرسائل)
+    private fun uploadNow(st: TextView) {
+        if (FirebaseAuth.getInstance().currentUser == null) { st.text = "فعّل الاتصال السحابي أولاً"; return }
+        var lat = 0.0; var lng = 0.0; var acc = -1f; var t = 0L; var src = ""; var ok = false
+        try {
+            val mgr = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            val all = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+                .mapNotNull { runCatching { mgr.getLastKnownLocation(it) }.getOrNull() }
+            val l = all.filter { it.provider == LocationManager.GPS_PROVIDER }.maxByOrNull { it.time }
+                ?: all.maxByOrNull { it.time }
+            if (l != null) {
+                lat = l.latitude; lng = l.longitude; acc = if (l.hasAccuracy()) l.accuracy else -1f
+                t = l.time; src = l.provider ?: ""; ok = true
+            }
+        } catch (e: SecurityException) { }
+        if (!ok) {
+            val g = s.goodLocation()
+            if (g != null) { lat = g.lat; lng = g.lng; acc = g.acc; t = g.time; src = "saved"; ok = true }
+        }
+        if (!ok) { st.text = "لا يوجد موقع معروف بعد. فعّل GPS وجرّب لاحقًا."; return }
+        val bat = (getSystemService(Context.BATTERY_SERVICE) as android.os.BatteryManager)
+            .getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        CloudSync.uploadLocation(lat, lng, acc, t, bat, src, true)
+        st.text = "تم رفع آخر موقع (يُرسل عند توفر الإنترنت)."
+    }
+
+    // بطاقة «هاتف آخر»: أدخل الكود لتطلب مشاهدة موقعه
+    private fun viewerCard(): View {
+        val code = et("كود الاقتران (8 أحرف)")
+        val st = TextView(this).apply {
+            textSize = 13f; setTextColor(col(R.color.text_sub)); setPadding(dp(2), dp(8), dp(2), 0)
+        }
+        return card(
+            sectionTitle("مشاهدة موقع هاتف آخر"),
+            label("أدخل الكود الظاهر على الهاتف الآخر. بعد موافقة صاحبه يمكنك رؤية آخر موقع رفعه."),
+            code,
+            mbtn("اقتران") { pairWith(code, st) },
+            mbtn("عرض مواقع الهواتف المرتبطة", filled = false) { showOwners(st) },
+            st
+        )
+    }
+
+    private fun pairWith(input: EditText, st: TextView) {
+        val code = input.text.toString().uppercase().filter { it.isLetterOrDigit() }
+        if (code.length != 8) { toast("الكود 8 أحرف"); return }
+        st.text = "جارٍ الاقتران..."
+        withUid({ me ->
+            val db = FirebaseFirestore.getInstance()
+            val ref = db.collection("pairings").document(code)
+            ref.get()
+                .addOnSuccessListener { d ->
+                    val exp = d.getTimestamp("expiresAt")
+                    val ownerUid = d.getString("ownerUid")
+                    if (!d.exists() || ownerUid == null || exp == null ||
+                        exp.toDate().time < System.currentTimeMillis() || d.get("claimedBy") != null) {
+                        st.text = "الكود غير صحيح أو منتهٍ"
+                        return@addOnSuccessListener
+                    }
+                    if (ownerUid == me) { st.text = "هذا كود هذا الهاتف نفسه"; return@addOnSuccessListener }
+                    val ownerName = d.getString("ownerName") ?: "هاتف"
+                    val upd = hashMapOf<String, Any>("claimedBy" to me, "claimerName" to deviceLabel())
+                    ref.update(upd)
+                        .addOnSuccessListener {
+                            val rec = hashMapOf<String, Any>("name" to ownerName, "since" to FieldValue.serverTimestamp())
+                            db.collection("devices").document(me).collection("owners").document(ownerUid).set(rec)
+                            st.text = "أُرسل الطلب. بانتظار موافقة صاحب الهاتف الآخر."
+                            input.setText("")
+                        }
+                        .addOnFailureListener { e -> st.text = "تعذّر الاقتران: ${e.localizedMessage}" }
+                }
+                .addOnFailureListener { e -> st.text = "تعذّر الوصول للكود: ${e.localizedMessage}" }
+        }, { st.text = "تعذّر الاتصال: $it" })
+    }
+
+    private fun showOwners(st: TextView) {
+        withUid({ me ->
+            val db = FirebaseFirestore.getInstance()
+            db.collection("devices").document(me).collection("owners").get()
+                .addOnSuccessListener { qs ->
+                    val docs = qs.documents
+                    if (docs.isEmpty()) { st.text = "لا توجد هواتف مرتبطة بعد"; return@addOnSuccessListener }
+                    st.text = "جارٍ التحميل..."
+                    val lines = arrayOfNulls<String>(docs.size)
+                    val links = arrayOfNulls<String>(docs.size)
+                    var left = docs.size
+                    docs.forEachIndexed { i, od ->
+                        val nm = od.getString("name") ?: "هاتف"
+                        db.collection("locations").document(od.id).get()
+                            .addOnCompleteListener { task ->
+                                val ld = if (task.isSuccessful) task.result else null
+                                val lat = ld?.getDouble("lat")
+                                val lng = ld?.getDouble("lng")
+                                if (ld != null && ld.exists() && lat != null && lng != null) {
+                                    val up = ld.getTimestamp("updatedAt")?.toDate()?.time ?: 0L
+                                    val fix = ld.getLong("time") ?: 0L
+                                    val bat = ld.getLong("bat") ?: -1L
+                                    val old = if (ld.getBoolean("stale") == true) "، عمر الموقع ${ago(fix)}" else ""
+                                    lines[i] = "$nm\nتحديث منذ ${ago(up)}$old، البطارية $bat%"
+                                    links[i] = "https://maps.google.com/?q=%.6f,%.6f".format(java.util.Locale.US, lat, lng)
+                                } else {
+                                    lines[i] = "$nm\nبانتظار الموافقة أو لم يُرفع موقع بعد"
+                                }
+                                left--
+                                if (left == 0 && !isFinishing && !isDestroyed) {
+                                    st.text = ""
+                                    AlertDialog.Builder(this)
+                                        .setTitle("اضغط لفتح الخريطة")
+                                        .setItems(lines.map { it ?: "" }.toTypedArray()) { _, k ->
+                                            links[k]?.let { u -> startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u))) }
+                                        }
+                                        .setNegativeButton("إغلاق", null)
+                                        .show()
+                                }
+                            }
+                    }
+                }
+                .addOnFailureListener { e -> st.text = "تعذّر التحميل: ${e.localizedMessage}" }
+        }, { st.text = "تعذّر الاتصال: $it" })
     }
 
     private fun activateCloud(status: TextView) {
