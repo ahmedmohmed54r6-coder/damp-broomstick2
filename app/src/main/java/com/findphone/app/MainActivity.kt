@@ -256,7 +256,7 @@ class MainActivity : Activity() {
         val cloudStatus = TextView(this).apply {
             textSize = 13.5f
             setTextColor(col(R.color.text_sub))
-            text = "حالة الحساب السحابي: جارٍ التحقق..."
+            text = "حالة الحساب السحابي: غير مسجل بعد"
             setPadding(dp(2), dp(6), dp(2), dp(6))
         }
         root.addView(card(

@@ -7,7 +7,7 @@ android {
     namespace 'com.findphone.app'
     compileSdk 34
     defaultConfig {
-        applicationId "com.findphone.app"
+        applicationId "com.findphone2.app"
         minSdk 26
         targetSdk 34
         versionCode 2
