@@ -2,7 +2,10 @@ package com.findphone.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.admin.DevicePolicyManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -345,9 +348,11 @@ class MainActivity : Activity() {
     private fun adminComponent() = ComponentName(this, AdminReceiver::class.java)
 
     private fun adminCard(): LinearLayout {
-        val active = devicePolicyManager().isAdminActive(adminComponent())
+        val dpm = devicePolicyManager()
+        val active = dpm.isAdminActive(adminComponent())
+        val isOwner = try { dpm.isDeviceOwnerApp(packageName) } catch (e: Exception) { false }
         return if (active) {
-            card(
+            val rows = mutableListOf<View>(
                 sectionTitle("حماية الحذف"),
                 TextView(this).apply { text = "✓ مفعّلة — لا يمكن حذف التطبيق قبل إلغاء هذه الحماية"; setTextColor(col(R.color.ok)); setTypeface(typeface, Typeface.BOLD) },
                 mbtn("إلغاء حماية الحذف", filled = false) {
@@ -355,6 +360,30 @@ class MainActivity : Activity() {
                     toast("أُلغيت الحماية"); refresh()
                 }
             )
+            rows += View(this).apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)) }
+            rows += sectionTitle("منع إيقاف خدمة الموقع")
+            if (isOwner) {
+                val restricted = try { dpm.getUserRestrictions(adminComponent()).getBoolean(android.os.UserManager.DISALLOW_CONFIG_LOCATION) } catch (e: Exception) { false }
+                if (restricted) {
+                    rows += TextView(this).apply { text = "✓ مفعّل — لا يمكن إيقاف الموقع من الإعدادات"; setTextColor(col(R.color.ok)); setTypeface(typeface, Typeface.BOLD) }
+                    rows += mbtn("إلغاء المنع", filled = false) {
+                        try { dpm.clearUserRestriction(adminComponent(), android.os.UserManager.DISALLOW_CONFIG_LOCATION); toast("أُلغي المنع") }
+                        catch (e: Exception) { toast("تعذّر: ${e.message}") }
+                        refresh()
+                    }
+                } else {
+                    rows += label("يمنع المستخدم من فتح إعدادات الموقع أو إيقافه نهائيًا.")
+                    rows += mbtn("تفعيل المنع", filled = false) {
+                        try { dpm.addUserRestriction(adminComponent(), android.os.UserManager.DISALLOW_CONFIG_LOCATION); toast("تم المنع") }
+                        catch (e: Exception) { toast("تعذّر: ${e.message}") }
+                        refresh()
+                    }
+                }
+            } else {
+                rows += label("هذا غير متاح بالصلاحية الحالية. يتطلب أن يكون التطبيق «مالك الجهاز» (Device Owner)، وهذا أقوى من «مسؤول الجهاز» العادي ولا يمكن منحه إلا عبر أمر من كمبيوتر، وعادة قبل إضافة أي حساب جوجل على الهاتف (أو بعد ضبط المصنع).")
+                rows += mbtn("عرض خطوات التفعيل (ADB)", filled = false) { showOwnerInstructions() }
+            }
+            card(*rows.toTypedArray())
         } else {
             card(
                 sectionTitle("حماية الحذف"),
@@ -370,6 +399,29 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() { when (current) { "setup" -> renderSetup(); "settings" -> renderSettings(); else -> {} } }
+
+    private fun showOwnerInstructions() {
+        val cmd = "adb shell dpm set-device-owner com.findphone.app/.AdminReceiver"
+        AlertDialog.Builder(this)
+            .setTitle("تفعيل «مالك الجهاز»")
+            .setMessage(
+                "الشروط: لا يوجد أي حساب جوجل أو حساب آخر مُضاف على الهاتف (أو اعمل ضبط مصنع أولًا)، " +
+                "وتفعيل «تصحيح أخطاء USB» من إعدادات المطوّر، وتثبيت أدوات Android (adb) على كمبيوتر.\n\n" +
+                "الخطوات:\n" +
+                "1) ثبّت التطبيق على الهاتف (هذا الملف نفسه).\n" +
+                "2) لا تفتحه ولا تضف أي حساب على الهاتف بعد.\n" +
+                "3) وصّل الهاتف بالكمبيوتر وفعّل تصحيح USB.\n" +
+                "4) نفّذ هذا الأمر من الكمبيوتر:\n\n$cmd\n\n" +
+                "5) افتح التطبيق بعدها، ستجد زر «تفعيل المنع» متاحًا.\n\n" +
+                "إن كان على الهاتف حساب بالفعل، الطريقة الوحيدة هي ضبط المصنع أولًا ثم تكرار الخطوات قبل إعادة إضافة أي حساب."
+            )
+            .setPositiveButton("نسخ الأمر") { _, _ ->
+                (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("adb", cmd))
+                toast("نُسخ الأمر")
+            }
+            .setNegativeButton("إغلاق", null)
+            .show()
+    }
 
     private fun oemAutostartIntent(): Intent? {
         val candidates = when (Build.MANUFACTURER.lowercase()) {
