@@ -1,21 +1,21 @@
 {
   "project_info": {
-    "project_number": "396580734859",
-    "project_id": "findphone-67d24",
-    "storage_bucket": "findphone-67d24.firebasestorage.app"
+    "project_number": "525952570994",
+    "project_id": "findphone-87b52",
+    "storage_bucket": "findphone-87b52.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:396580734859:android:75ca73bb0d2bd25b37118e",
+        "mobilesdk_app_id": "1:525952570994:android:973fba909b402bfad5d4eb",
         "android_client_info": {
-          "package_name": "com.findphone.app"
+          "package_name": "com.findphone1.app"
         }
       },
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyCLXbqkeWHTRPfPO0H8ldFQ92XF_CWt6zc"
+          "current_key": "AIzaSyC43VI43jYSGurCHg06H3m6V8iAWIDSzh0"
         }
       ],
       "services": {
@@ -26,7 +26,7 @@
     },
     {
       "client_info": {
-        "mobilesdk_app_id": "1:396580734859:android:74ddaa81fbb2bea637118e",
+        "mobilesdk_app_id": "1:525952570994:android:5dbb4438a9a7241ed5d4eb",
         "android_client_info": {
           "package_name": "com.findphone2.app"
         }
@@ -34,7 +34,7 @@
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyCLXbqkeWHTRPfPO0H8ldFQ92XF_CWt6zc"
+          "current_key": "AIzaSyC43VI43jYSGurCHg06H3m6V8iAWIDSzh0"
         }
       ],
       "services": {
