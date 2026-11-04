@@ -1,6 +1,8 @@
 package com.findphone.app
 
 import android.app.*
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -33,7 +35,13 @@ class ReplyService : Service() {
 
     private var to = ""
     private var ring = false
+    private var lockReq = false
+    private var lockDone = false
     private var sub = -1
+
+    // في مناطق التغطية الضعيفة (2G الخ) يكون موقع الشبكة سيئًا جدًا حتى من رقم دقته المعلن،
+    // فلا فائدة من إرساله إن تجاوزت دقته المعلنة هذا الحد: نفضّل الصدق بـ"لا إشارة بعد" بدل رقم مضلِّل.
+    private val NETWORK_USELESS_ACC = 3000f
 
     // "مزوّد الشبكة" (أبراج/واي فاي) قد يخطئ بعشرات الكيلومترات في مناطق ضعيفة التغطية، رغم
     // أنه يعلن دقة صغيرة. GPS (الأقمار) هو الموثوق فعلًا ولا يحتاج إنترنت، فنفضّله دائمًا تقريبًا
@@ -51,6 +59,8 @@ class ReplyService : Service() {
             val b = best
             val bw = if (b != null) weight(b) else Float.MAX_VALUE
             if (b == null || w < bw) best = l
+            if (l.provider == LocationManager.GPS_PROVIDER && (!l.hasAccuracy() || l.accuracy <= 200f))
+                Store(this@ReplyService).saveGoodLocation(l.latitude, l.longitude, if (l.hasAccuracy()) l.accuracy else -1f, l.time)
             val isGpsGood = l.provider == LocationManager.GPS_PROVIDER && l.hasAccuracy() && l.accuracy <= 30f
             if (!sentOnce && isGpsGood) sendNow(false)
             else if (sentOnce && !sentUpdate && isGpsGood && (b == null || w < bw - 20f)) sendUpdate(l)
@@ -76,6 +86,7 @@ class ReplyService : Service() {
 
         to = i.getStringExtra("to") ?: run { stopSelf(); return START_NOT_STICKY }
         ring = i.getBooleanExtra("ring", false)
+        lockReq = i.getBooleanExtra("lock", false)
         sub = i.getIntExtra("sub", -1)
 
         // يبقي المعالج مستيقظًا أثناء انتظار GPS (مهم عند الشاشة المقفلة وبدون إنترنت)
@@ -83,20 +94,40 @@ class ReplyService : Service() {
         wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "findphone:reply").apply { acquire(5 * 60_000L) }
 
         if (ring) startRing()
+        if (lockReq) lockDone = tryLockNow()
 
         val mgr = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         lm = mgr
+        requestUpdates(mgr)
+
+        // لا ننتظر دقيقتين قبل أول رد: نرسل بسرعة بأفضل موقع متاح (حتى لو قديم)،
+        // ثم نرسل تحديثًا واحدًا فقط إن وصل موقع أدق خلال الدقيقة التالية.
+        h.postDelayed({ if (!sentOnce) sendNow(true) }, 7_000L)
+        // نُبقي الاستماع لـGPS فترة أطول بعد الرد الأول، لإعطائه فرصة حقيقية لالتقاط إشارة
+        // (قد يحتاج تثبيتًا باردًا 30-90 ثانية بدون إنترنت) قبل إرسال تحديث دقيق لاحقًا
+        h.postDelayed({ stopIfIdle() }, 100_000L)
+        return START_NOT_STICKY
+    }
+
+    // قفل فوري للشاشة عبر صلاحية "مسؤول الجهاز" العادية — استخدام شرعي ومباشر مصمَّم لهذا الغرض
+    // تحديدًا (نفس آلية "تأمين الشاشة الآن" في Find My Device). لا يفرض رمزًا جديدًا من الصفر:
+    // يُفعّل قفل الشاشة الموجود أصلًا على الهاتف (إن لم يوجد، يُطفئ الشاشة فقط دون رمز حقيقي).
+    private fun tryLockNow(): Boolean {
+        return try {
+            val dpm = getSystemService(DevicePolicyManager::class.java)
+            val admin = ComponentName(this, AdminReceiver::class.java)
+            if (!dpm.isAdminActive(admin)) return false
+            dpm.lockNow()
+            true
+        } catch (e: Exception) { false }
+    }
+
+    private fun requestUpdates(mgr: LocationManager) {
         try {
             // GPS يعمل بدون إنترنت؛ مزوّد الشبكة يساعد فقط عند توفر الإنترنت
             for (pr in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER))
                 if (mgr.isProviderEnabled(pr)) { mgr.requestLocationUpdates(pr, 0L, 0f, listener, Looper.getMainLooper()); anyProvider = true }
         } catch (e: SecurityException) { }
-
-        // لا ننتظر دقيقتين قبل أول رد: نرسل بسرعة بأفضل موقع متاح (حتى لو قديم)،
-        // ثم نرسل تحديثًا واحدًا فقط إن وصل موقع أدق خلال الدقيقة التالية.
-        h.postDelayed({ if (!sentOnce) sendNow(true) }, 7_000L)
-        h.postDelayed({ stopIfIdle() }, 65_000L)
-        return START_NOT_STICKY
     }
 
     private fun stopIfIdle() {
@@ -125,8 +156,20 @@ class ReplyService : Service() {
         val mgr = lm ?: return null
         val all = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
             .mapNotNull { runCatching { mgr.getLastKnownLocation(it) }.getOrNull() }
+        all.filter { it.provider == LocationManager.GPS_PROVIDER }.maxByOrNull { it.time }?.let {
+            Store(this).saveGoodLocation(it.latitude, it.longitude, if (it.hasAccuracy()) it.accuracy else -1f, it.time)
+        }
         return all.filter { it.provider == LocationManager.GPS_PROVIDER }.maxByOrNull { it.time }
             ?: all.maxByOrNull { it.time }
+    }
+
+    // آخر موقع GPS موثوق خزّنه تطبيقنا بنفسه، كملاذ أخير قبل "لا إشارة" أو موقع الشبكة الرديء
+    private fun ourSavedGood(): Location? {
+        val g = Store(this).goodLocation() ?: return null
+        return Location("saved").apply {
+            latitude = g.lat; longitude = g.lng; time = g.time
+            if (g.acc >= 0f) accuracy = g.acc
+        }
     }
 
     private fun format(l: Location?, stale: Boolean, bat: Int): String {
@@ -136,8 +179,8 @@ class ReplyService : Service() {
             if (l.hasAccuracy()) sb.append(" acc ${l.accuracy.toInt()}m")
             val ageMin = (System.currentTimeMillis() - l.time) / 60_000
             if (stale && l.time > 0 && ageMin >= 1) sb.append(" old ${ageMin}m")
-            // تنبيه صريح عندما يكون المصدر "الشبكة" وليس GPS، لأنه الأقل موثوقية
-            if (l.provider != LocationManager.GPS_PROVIDER) sb.append(" [network, may be off by km]")
+            // تنبيه صريح فقط عندما يكون المصدر فعلاً "الشبكة" (غير GPS وغير محفوظ من قبلنا)
+            if (l.provider != LocationManager.GPS_PROVIDER && l.provider != "saved") sb.append(" [network, may be off by km]")
             sb.append(" bat $bat%")
         } else {
             sb.append(if (anyProvider) "no GPS fix yet" else "location is OFF").append(", bat $bat%")
@@ -154,8 +197,20 @@ class ReplyService : Service() {
         sentOnce = true
         var l = best
         var stale = false
-        if (l == null && useFallback) { l = lastKnown(); stale = l != null }
-        val text = format(l, stale, battery())
+        if (l == null && useFallback) {
+            val sys = lastKnown()
+            val sysOk = sys != null && (sys.provider == LocationManager.GPS_PROVIDER ||
+                !sys.hasAccuracy() || sys.accuracy <= NETWORK_USELESS_ACC)
+            if (sysOk) { l = sys; stale = l != null }
+            else {
+                // موقع النظام مفقود أو موقع شبكة رديء جدًا: نلجأ لآخر GPS موثوق خزّنه تطبيقنا بنفسه
+                val saved = ourSavedGood()
+                if (saved != null) { l = saved; stale = true }
+                else { l = null; stale = false }   // لا شيء موثوق إطلاقًا: الصدق أفضل من رقم مضلِّل
+            }
+        }
+        var text = format(l, stale, battery())
+        if (lockReq) text += if (lockDone) " [locked]" else " [lock failed: enable device-admin protection]"
         job = SmsJob(this, to, text, sub,
             onStatus = { updateNotification(it) },
             onFinished = { ok ->

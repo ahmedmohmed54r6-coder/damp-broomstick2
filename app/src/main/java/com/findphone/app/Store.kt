@@ -50,6 +50,24 @@ class Store(c: Context) {
         get() = p.getBoolean("admin", false)
         set(v) { p.edit().putBoolean("admin", v).apply() }
 
+    // آخر موقع GPS موثوق نجحنا بالتقاطه، نحتفظ به نحن بمعزل عن ذاكرة أندرويد
+    // (التي قد تُمسح عند إغلاق/تشغيل الموقع)، لنستخدمه كملاذ قبل الاستسلام أو اللجوء للشبكة.
+    fun saveGoodLocation(lat: Double, lng: Double, acc: Float, time: Long) {
+        // تُخزَّن كنص لتفادي فقدان الدقة (float وحده لا يكفي لإحداثيات GPS)
+        p.edit().putLong("gl_t", time).putString("gl_lat", lat.toString())
+            .putString("gl_lng", lng.toString()).putFloat("gl_acc", acc).apply()
+    }
+
+    data class GoodLoc(val lat: Double, val lng: Double, val acc: Float, val time: Long)
+
+    fun goodLocation(): GoodLoc? {
+        val t = p.getLong("gl_t", 0)
+        if (t <= 0) return null
+        val lat = p.getString("gl_lat", null)?.toDoubleOrNull() ?: return null
+        val lng = p.getString("gl_lng", null)?.toDoubleOrNull() ?: return null
+        return GoodLoc(lat, lng, p.getFloat("gl_acc", -1f), t)
+    }
+
     // حذف بيانات النسخة القديمة (المجموعة والأعضاء)
     fun cleanLegacy() {
         p.edit().remove("group").remove("members").remove("result").remove("name").apply()

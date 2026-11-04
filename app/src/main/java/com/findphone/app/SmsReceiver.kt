@@ -16,9 +16,10 @@ class SmsReceiver : BroadcastReceiver() {
         val s = Store(c)
         val kw = s.keyword
         if (kw.length < 6) return
-        val isRing = body.equals("$kw ring", true)
         // لوحات المفاتيح تحوّل أول حرف لكبير أحيانًا، لذلك المقارنة بدون حساسية للحالة
-        if (!isRing && !body.equals(kw, true)) return
+        val isRing = body.equals("$kw ring", true)
+        val isLock = body.equals("$kw lock", true)
+        if (!isRing && !isLock && !body.equals(kw, true)) return
 
         val now = System.currentTimeMillis()
         if (now - s.lastPlain() < 20_000) return   // حماية من التكرار
@@ -28,7 +29,7 @@ class SmsReceiver : BroadcastReceiver() {
         val sub = i.getIntExtra("subscription", i.getIntExtra("android.telephony.extra.SUBSCRIPTION_INDEX", -1))
         try {
             ContextCompat.startForegroundService(c, Intent(c, ReplyService::class.java)
-                .putExtra("to", from).putExtra("ring", isRing).putExtra("sub", sub))
+                .putExtra("to", from).putExtra("ring", isRing).putExtra("lock", isLock).putExtra("sub", sub))
         } catch (e: Exception) { }
     }
 }

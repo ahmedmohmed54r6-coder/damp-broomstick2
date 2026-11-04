@@ -1,0 +1,17 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // كل جهاز يستطيع قراءة/تعديل سجل جهازه فقط.
+    // لا تسمح هذه القواعد بعدُ بمشاركة الأجهزة أو تنفيذ أوامر عن بُعد.
+    match /devices/{deviceUid} {
+      allow create, read, update: if request.auth != null
+                                  && request.auth.uid == deviceUid;
+      allow delete: if request.auth != null
+                    && request.auth.uid == deviceUid;
+    }
+    // إغلاق أي مجموعات أخرى افتراضيًا.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

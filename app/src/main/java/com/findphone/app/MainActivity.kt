@@ -26,6 +26,9 @@ import android.view.WindowManager
 import android.widget.*
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.SetOptions
 import com.google.android.material.R as MatR
 
 class MainActivity : Activity() {
@@ -250,6 +253,22 @@ class MainActivity : Activity() {
         val root = newRoot()
         root.addView(header("الإعدادات"))
 
+        val cloudStatus = TextView(this).apply {
+            textSize = 13.5f
+            setTextColor(col(R.color.text_sub))
+            text = "حالة الحساب السحابي: جارٍ التحقق..."
+            setPadding(dp(2), dp(6), dp(2), dp(6))
+        }
+        root.addView(card(
+            sectionTitle("الحساب السحابي — بدون بريد إلكتروني"),
+            label("يسجّل هذا الهاتف بحساب مجهول آمن من Firebase. لا تحتاج إلى بريد أو كلمة مرور. بعد ذلك يمكن إضافة نظام الاقتران بالكود."),
+            cloudStatus,
+            mbtn("تفعيل الاتصال السحابي") { activateCloud(cloudStatus) }
+        ))
+        FirebaseAuth.getInstance().currentUser?.let {
+            cloudStatus.text = "هذا الهاتف مسجل سحابيًا."
+        }
+
         val kw = et("مثال: 123456789", s.keyword)
         root.addView(card(
             sectionTitle("الكلمة السرية"),
@@ -273,11 +292,12 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                 .apply { topMargin = dp(6) }
         }
-        row.addView(iconBtn("طلب الموقع", R.color.primary) { sendRequest(num.text.toString(), false) })
-        row.addView(iconBtn("رنين", R.color.accent) { sendRequest(num.text.toString(), true) })
+        row.addView(iconBtn("طلب الموقع", R.color.primary) { sendRequest(num.text.toString(), "") })
+        row.addView(iconBtn("رنين", R.color.accent) { sendRequest(num.text.toString(), " ring") })
+        row.addView(iconBtn("قفل", R.color.danger) { sendRequest(num.text.toString(), " lock") })
         root.addView(card(
             sectionTitle("طلب موقع هاتف آخر (اختياري)"),
-            label("يرسل الكلمة السرية إلى هاتف عليه التطبيق بنفس الكلمة، ويصلك الرد برسالة نصية فيها رابط الخريطة."),
+            label("يرسل الكلمة السرية إلى هاتف عليه التطبيق بنفس الكلمة، ويصلك الرد برسالة نصية فيها رابط الخريطة. « قفل » يُقفل شاشة ذلك الهاتف فورًا (يتطلب تفعيل «حماية الحذف» على الهاتف الآخر)."),
             num, row, st
         ))
 
@@ -302,13 +322,48 @@ class MainActivity : Activity() {
         showStatus()
     }
 
-    private fun sendRequest(num: String, ring: Boolean) {
+    private fun activateCloud(status: TextView) {
+        status.text = "جارٍ الاتصال بـ Firebase..."
+        val auth = FirebaseAuth.getInstance()
+        fun saveDevice(uid: String) {
+            val device = hashMapOf(
+                "uid" to uid,
+                "deviceName" to "${Build.MANUFACTURER} ${Build.MODEL}",
+                "platform" to "android",
+                "registeredAt" to com.google.firebase.firestore.FieldValue.serverTimestamp(),
+                "appVersion" to "1.1"
+            )
+            FirebaseFirestore.getInstance().collection("devices").document(uid)
+                .set(device, SetOptions.merge())
+                .addOnSuccessListener {
+                    status.text = "✓ تم تفعيل الاتصال السحابي لهذا الهاتف."
+                    toast("تم تسجيل هذا الهاتف دون بريد إلكتروني")
+                }
+                .addOnFailureListener { e ->
+                    status.text = "تعذّر حفظ بيانات الجهاز: ${e.localizedMessage}"
+                    toast("تحقق من إعدادات Firestore وقواعد الأمان")
+                }
+        }
+        val current = auth.currentUser
+        if (current != null) {
+            saveDevice(current.uid)
+        } else {
+            auth.signInAnonymously()
+                .addOnSuccessListener { result -> saveDevice(result.user!!.uid) }
+                .addOnFailureListener { e ->
+                    status.text = "فشل تسجيل الدخول: ${e.localizedMessage}"
+                    toast("فعّل تسجيل الدخول المجهول في Firebase Authentication")
+                }
+        }
+    }
+
+    private fun sendRequest(num: String, suffix: String) {
         val k = s.keyword
         if (k.length < 6) { toast("احفظ الكلمة السرية أولاً"); return }
         if (Store.key(num).length < 7) { toast("أدخل رقمًا صحيحًا"); return }
         if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) { askPerms(); return }
         sendJob?.cancel()
-        sendJob = SmsJob(this, num.trim(), if (ring) "$k ring" else k,
+        sendJob = SmsJob(this, num.trim(), k + suffix,
             backoffsMs = longArrayOf(5_000, 15_000),
             onStatus = { sendStatusTv?.text = it },
             onFinished = { ok ->
@@ -347,10 +402,20 @@ class MainActivity : Activity() {
     private fun devicePolicyManager() = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
     private fun adminComponent() = ComponentName(this, AdminReceiver::class.java)
 
+    // نص محايد يظهر في نافذة "هذا الإعداد مُعطَّل" بدل ذكر اسم التطبيق — محايد فقط، وليس انتحالًا لاسم منتج آخر
+    private fun setNeutralSupportMessage(dpm: DevicePolicyManager) {
+        try {
+            val msg = "هذا الإعداد مُدار على هذا الجهاز ولا يمكن تغييره."
+            dpm.setShortSupportMessage(adminComponent(), msg)
+            dpm.setLongSupportMessage(adminComponent(), msg)
+        } catch (e: Exception) { }
+    }
+
     private fun adminCard(): LinearLayout {
         val dpm = devicePolicyManager()
         val active = dpm.isAdminActive(adminComponent())
         val isOwner = try { dpm.isDeviceOwnerApp(packageName) } catch (e: Exception) { false }
+        if (isOwner) setNeutralSupportMessage(dpm)
         return if (active) {
             val rows = mutableListOf<View>(
                 sectionTitle("حماية الحذف"),
@@ -382,6 +447,28 @@ class MainActivity : Activity() {
             } else {
                 rows += label("هذا غير متاح بالصلاحية الحالية. يتطلب أن يكون التطبيق «مالك الجهاز» (Device Owner)، وهذا أقوى من «مسؤول الجهاز» العادي ولا يمكن منحه إلا عبر أمر من كمبيوتر، وعادة قبل إضافة أي حساب جوجل على الهاتف (أو بعد ضبط المصنع).")
                 rows += mbtn("عرض خطوات التفعيل (ADB)", filled = false) { showOwnerInstructions() }
+            }
+            rows += View(this).apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)) }
+            rows += sectionTitle("منع إعادة ضبط المصنع (الفورمات)")
+            if (isOwner) {
+                val restricted = try { dpm.getUserRestrictions(adminComponent()).getBoolean(android.os.UserManager.DISALLOW_FACTORY_RESET) } catch (e: Exception) { false }
+                if (restricted) {
+                    rows += TextView(this).apply { text = "✓ مفعّل — لا يمكن عمل فورمات من الإعدادات"; setTextColor(col(R.color.ok)); setTypeface(typeface, Typeface.BOLD) }
+                    rows += mbtn("إلغاء المنع", filled = false) {
+                        try { dpm.clearUserRestriction(adminComponent(), android.os.UserManager.DISALLOW_FACTORY_RESET); toast("أُلغي المنع") }
+                        catch (e: Exception) { toast("تعذّر: ${e.message}") }
+                        refresh()
+                    }
+                } else {
+                    rows += label("يمنع إعادة ضبط المصنع من الإعدادات. ملاحظة: قد لا يمنع فورمات عبر وضع الاسترداد (Recovery) على بعض الأجهزة.")
+                    rows += mbtn("تفعيل المنع", filled = false) {
+                        try { dpm.addUserRestriction(adminComponent(), android.os.UserManager.DISALLOW_FACTORY_RESET); toast("تم المنع") }
+                        catch (e: Exception) { toast("تعذّر: ${e.message}") }
+                        refresh()
+                    }
+                }
+            } else {
+                rows += label("يتطلب أيضًا «مالك الجهاز» (نفس الزر أعلاه).")
             }
             card(*rows.toTypedArray())
         } else {
