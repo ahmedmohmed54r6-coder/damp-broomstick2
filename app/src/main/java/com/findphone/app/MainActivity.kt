@@ -13,6 +13,8 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
@@ -44,6 +46,47 @@ class MainActivity : Activity() {
     private var current = ""
     private var stoppedAt = 0L
 
+    // متتبّع خفيف يعمل فقط أثناء فتح شاشة الإعدادات: يحفظ أي إشارة GPS موثوقة فوراً،
+    // ويرفعها للسحابة إن كان الاتصال السحابي مفعّلاً، بدل الاعتماد فقط على لحظة رد SMS.
+    private var liveLm: LocationManager? = null
+    private var liveListening = false
+    private val liveListener = object : LocationListener {
+        override fun onLocationChanged(l: Location) {
+            if (l.provider != LocationManager.GPS_PROVIDER) return
+            val acc = if (l.hasAccuracy()) l.accuracy else -1f
+            if (acc < 0f || acc > 200f) return
+            s.saveGoodLocation(l.latitude, l.longitude, acc, l.time)
+            if (FirebaseAuth.getInstance().currentUser != null) {
+                val bat = try {
+                    (getSystemService(Context.BATTERY_SERVICE) as android.os.BatteryManager)
+                        .getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                } catch (e: Exception) { -1 }
+                CloudSync.uploadLocation(l.latitude, l.longitude, acc, l.time, bat, l.provider ?: "", false)
+            }
+        }
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+        override fun onStatusChanged(p: String?, st: Int, e: Bundle?) {}
+        override fun onProviderEnabled(p: String) {}
+        override fun onProviderDisabled(p: String) {}
+    }
+
+    private fun startLiveTracking() {
+        if (liveListening) return
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
+        try {
+            val mgr = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            liveLm = mgr
+            mgr.requestLocationUpdates(LocationManager.GPS_PROVIDER, 4_000L, 0f, liveListener, mainLooper)
+            liveListening = true
+        } catch (e: Exception) { }
+    }
+
+    private fun stopLiveTracking() {
+        if (!liveListening) return
+        try { liveLm?.removeUpdates(liveListener) } catch (e: Exception) { }
+        liveListening = false
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         // يمنع لقطات الشاشة وإظهار المحتوى في قائمة التطبيقات الأخيرة
@@ -66,11 +109,12 @@ class MainActivity : Activity() {
             current = want
             when (want) { "setup" -> renderSetup(); "lock" -> renderLock(); else -> renderSettings() }
         } else if (want == "setup" || want == "settings") refresh() else showStatus()
+        if (want == "settings") startLiveTracking() else stopLiveTracking()
     }
 
-    override fun onStop() { super.onStop(); stoppedAt = System.currentTimeMillis() }
+    override fun onStop() { super.onStop(); stoppedAt = System.currentTimeMillis(); stopLiveTracking() }
 
-    override fun onDestroy() { sendJob?.cancel(); pairReg?.remove(); super.onDestroy() }
+    override fun onDestroy() { sendJob?.cancel(); pairReg?.remove(); stopLiveTracking(); super.onDestroy() }
 
     // ---------- أدوات مساعدة ----------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -452,27 +496,43 @@ class MainActivity : Activity() {
     // يرفع آخر موقع معروف (يُستخدم أيضًا تلقائيًا عند الرد على الرسائل)
     private fun uploadNow(st: TextView) {
         if (FirebaseAuth.getInstance().currentUser == null) { st.text = "فعّل الاتصال السحابي أولاً"; return }
-        var lat = 0.0; var lng = 0.0; var acc = -1f; var t = 0L; var src = ""; var ok = false
+        var lat = 0.0; var lng = 0.0; var acc = -1f; var t = 0L; var src = ""; var ok = false; var fromNetwork = false
+
+        // أولاً: آخر GPS مباشر من النظام (الأحدث والأدق إن وُجد)
         try {
             val mgr = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-            val all = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
-                .mapNotNull { runCatching { mgr.getLastKnownLocation(it) }.getOrNull() }
-            val l = all.filter { it.provider == LocationManager.GPS_PROVIDER }.maxByOrNull { it.time }
-                ?: all.maxByOrNull { it.time }
-            if (l != null) {
-                lat = l.latitude; lng = l.longitude; acc = if (l.hasAccuracy()) l.accuracy else -1f
-                t = l.time; src = l.provider ?: ""; ok = true
+            val gps = runCatching { mgr.getLastKnownLocation(LocationManager.GPS_PROVIDER) }.getOrNull()
+            if (gps != null) {
+                lat = gps.latitude; lng = gps.longitude; acc = if (gps.hasAccuracy()) gps.accuracy else -1f
+                t = gps.time; src = gps.provider ?: "gps"; ok = true
             }
         } catch (e: SecurityException) { }
+
+        // ثانيًا: آخر موقع GPS موثوق خزّنه التطبيق بنفسه (أفضل من موقع الشبكة مهما كان عمره)
         if (!ok) {
             val g = s.goodLocation()
             if (g != null) { lat = g.lat; lng = g.lng; acc = g.acc; t = g.time; src = "saved"; ok = true }
         }
+
+        // أخيرًا فقط: موقع الشبكة، مع تنبيه صريح أنه قد يكون غير دقيق
+        if (!ok) {
+            try {
+                val mgr = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                val net = runCatching { mgr.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) }.getOrNull()
+                    ?: runCatching { mgr.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER) }.getOrNull()
+                if (net != null) {
+                    lat = net.latitude; lng = net.longitude; acc = if (net.hasAccuracy()) net.accuracy else -1f
+                    t = net.time; src = net.provider ?: "network"; ok = true; fromNetwork = true
+                }
+            } catch (e: SecurityException) { }
+        }
+
         if (!ok) { st.text = "لا يوجد موقع معروف بعد. فعّل GPS وجرّب لاحقًا."; return }
         val bat = (getSystemService(Context.BATTERY_SERVICE) as android.os.BatteryManager)
             .getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
         CloudSync.uploadLocation(lat, lng, acc, t, bat, src, true)
-        st.text = "تم رفع آخر موقع (يُرسل عند توفر الإنترنت)."
+        st.text = if (fromNetwork) "تم رفع موقع تقريبي من الشبكة فقط (قد يخطئ بكيلومترات). لا يوجد GPS محفوظ بعد."
+                  else "تم رفع آخر موقع موثوق (يُرسل عند توفر الإنترنت)."
     }
 
     // بطاقة «هاتف آخر»: أدخل الكود لتطلب مشاهدة موقعه
